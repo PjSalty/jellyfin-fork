@@ -1,0 +1,53 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 9.0.x
+
+      - name: Assemble from upstream
+        run: ./build/assemble.sh
+
+      - name: Build the patched server
+        run: dotnet build upstream/Jellyfin.Server/Jellyfin.Server.csproj -c Release -p:NoWarn=CA1707
+
+      - name: Smoke test
+        run: ./tests/smoke.sh
+
+      # The public artifact IS the patch series: apply it to the upstream tag
+      # in UPSTREAM_REF and you have this release's exact tree.
+      - name: Package the patch series
+        run: |
+          tar -czf "jellyfin-fork-patches-${GITHUB_REF_NAME}.tar.gz" UPSTREAM_REF patches/
+          sha256sum "jellyfin-fork-patches-${GITHUB_REF_NAME}.tar.gz" > SHA256SUMS
+
+      - name: Changelog for this tag
+        uses: orhun/git-cliff-action@v4
+        with:
+          config: cliff.toml
+          args: --latest --strip header
+        env:
+          OUTPUT: RELEASE_NOTES.md
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          files: |
+            jellyfin-fork-patches-*.tar.gz
+            SHA256SUMS

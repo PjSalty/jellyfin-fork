@@ -1,0 +1,93 @@
+#!/usr/bin/env bash
+#
+# Script: smoke.sh
+# Description: Two-replica smoke test. A migrate Job seeds the schema once,
+#              then a leader and a replica boot with migrations gated off.
+#              Asserts: both healthy, wizard on the leader, a token minted on
+#              the leader authenticates on the replica (read-through), browse
+#              works on both, and the replica armed no scheduled tasks.
+# Usage: ./tests/smoke.sh   (expects ../upstream to be assembled, see build/assemble.sh)
+#
+
+set -euo pipefail
+
+TESTS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+readonly TESTS_DIR
+# JELLYFIN_HOST: localhost for a native docker daemon; the dind service alias in CI.
+HOST="${JELLYFIN_HOST:-localhost}"
+readonly LEADER_URL="http://${HOST}:8096"
+readonly REPLICA_URL="http://${HOST}:8097"
+readonly COMPOSE="docker compose -f ${TESTS_DIR}/docker-compose.yml"
+
+info() { echo "[smoke] $*"; }
+die()  { echo "[smoke] FAIL: $*" >&2; exit 1; }
+
+cleanup() {
+    rc=$?
+    if [ "${rc}" -ne 0 ]; then
+        for svc in migrate jellyfin-leader jellyfin-replica; do
+            echo "[smoke] ${svc} logs (last 120 lines, health spam filtered):" >&2
+            ${COMPOSE} logs "${svc}" 2>/dev/null | grep -viE 'healthcheckservice|health check' | tail -120 >&2 || true
+        done
+    fi
+    ${COMPOSE} down -v >/dev/null 2>&1 || true
+    exit "${rc}"
+}
+trap cleanup EXIT
+
+wait_healthy() {
+    url="$1"
+    for _ in $(seq 1 240); do
+        if [ "$(curl -s "${url}/health")" = "Healthy" ]; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+info "starting stack (builds the patched server image, runs the migrate pass)"
+${COMPOSE} up -d --build
+wait_healthy "${LEADER_URL}" || die "leader never became healthy"
+wait_healthy "${REPLICA_URL}" || die "replica never became healthy"
+
+info "asserting the skip-gate engaged on both serving pods"
+${COMPOSE} logs jellyfin-leader | grep -i "skip" | grep -qi "migration" || die "leader skip-gate log line missing"
+${COMPOSE} logs jellyfin-replica | grep -i "skip" | grep -qi "migration" || die "replica skip-gate log line missing"
+
+info "completing the startup wizard on the leader"
+wizard() {
+    step="$1"; shift
+    if ! curl -sf "$@" > /dev/null; then
+        die "wizard step failed: ${step}"
+    fi
+}
+wizard configuration -X POST "${LEADER_URL}/Startup/Configuration" -H 'Content-Type: application/json' \
+    -d '{"UICulture":"en-US","MetadataCountryCode":"US","PreferredMetadataLanguage":"en"}'
+wizard first-user-get "${LEADER_URL}/Startup/User"
+wizard first-user-set -X POST "${LEADER_URL}/Startup/User" -H 'Content-Type: application/json' \
+    -d '{"Name":"smoke","Password":"smoketest"}'
+wizard complete -X POST "${LEADER_URL}/Startup/Complete"
+
+info "authenticating on the leader"
+auth_header='X-Emby-Authorization: MediaBrowser Client="smoke", Device="ci", DeviceId="ci", Version="1"'
+token="$(curl -sf -X POST "${LEADER_URL}/Users/AuthenticateByName" \
+    -H 'Content-Type: application/json' -H "${auth_header}" \
+    -d '{"Username":"smoke","Pw":"smoketest"}' | jq -r '.AccessToken')"
+if [ -z "${token}" ] || [ "${token}" = "null" ]; then
+    die "authentication failed on the leader"
+fi
+user_id="$(curl -sf "${LEADER_URL}/Users/Me" -H "X-Emby-Token: ${token}" | jq -r '.Id')"
+
+info "asserting the LEADER-minted token works on the REPLICA (read-through)"
+code="$(curl -s -o /dev/null -w '%{http_code}' "${REPLICA_URL}/Users/Me" -H "X-Emby-Token: ${token}")"
+[ "${code}" = "200" ] || die "replica rejected a leader-minted token (http ${code}): read-through broken"
+
+info "browsing on both pods"
+curl -sf "${LEADER_URL}/Users/${user_id}/Items?Recursive=true" -H "X-Emby-Token: ${token}" > /dev/null || die "browse failed on leader"
+curl -sf "${REPLICA_URL}/Users/${user_id}/Items?Recursive=true" -H "X-Emby-Token: ${token}" > /dev/null || die "browse failed on replica"
+
+info "asserting the replica disarmed background work"
+${COMPOSE} logs jellyfin-replica | grep -qiE "follower|disarm|replica role" || die "replica role log line missing"
+
+info "PASS"

@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sat, 11 Jul 2026 08:18:32 -0500
+Subject: [PATCH 2/5] migrations: skip-gate for replica processes
+
+Intent: JELLYFIN_SKIP_MIGRATIONS=true turns migration execution into a
+checkpoint: zero pending (EF model + code migrations) means one info line
+and normal startup; any pending fails fast naming the count and pointing
+at the migration Job (--mode MigrateSystem). Replicas set the env, the
+Job does not.
+Drop when: upstream grows an equivalent gate.
+---
+ .../Migrations/JellyfinMigrationService.cs    | 37 +++++++++++++++++++
+ 1 file changed, 37 insertions(+)
+
+diff --git a/Jellyfin.Server/Migrations/JellyfinMigrationService.cs b/Jellyfin.Server/Migrations/JellyfinMigrationService.cs
+index d664b71..0aeae1a 100644
+--- a/Jellyfin.Server/Migrations/JellyfinMigrationService.cs
++++ b/Jellyfin.Server/Migrations/JellyfinMigrationService.cs
+@@ -28,12 +28,14 @@ namespace Jellyfin.Server.Migrations;
+ internal class JellyfinMigrationService
+ {
+     private const string DbFilename = "library.db";
++    private const string SkipMigrationsVariable = "JELLYFIN_SKIP_MIGRATIONS";
+     private readonly IDbContextFactory<JellyfinDbContext> _dbContextFactory;
+     private readonly ILoggerFactory _loggerFactory;
+     private readonly IStartupLogger _startupLogger;
+     private readonly IBackupService? _backupService;
+     private readonly IJellyfinDatabaseProvider? _jellyfinDatabaseProvider;
+     private readonly IApplicationPaths _applicationPaths;
++    private static bool _skipGatePassed;
+     private (string? LibraryDb, string? JellyfinDb, BackupManifestDto? FullBackup) _backupKey;
+ 
+     /// <summary>
+@@ -185,6 +187,12 @@ internal class JellyfinMigrationService
+ 
+     public async Task MigrateStepAsync(JellyfinMigrationStageTypes stage, IServiceProvider? serviceProvider)
+     {
++        if (bool.TryParse(Environment.GetEnvironmentVariable(SkipMigrationsVariable), out var skipMigrations) && skipMigrations)
++        {
++            await EnsureNoPendingMigrationsAsync().ConfigureAwait(false);
++            return;
++        }
++
+         var logger = _startupLogger.With(_loggerFactory.CreateLogger<JellyfinMigrationService>()).BeginGroup($"Migrate stage {stage}.");
+         ICollection<CodeMigration> migrationStage = (Migrations.FirstOrDefault(e => e.Stage == stage) as ICollection<CodeMigration>) ?? [];
+ 
+@@ -279,6 +287,35 @@ internal class JellyfinMigrationService
+         return Assembly.GetEntryAssembly()!.GetName().Version!.ToString();
+     }
+ 
++    // Multi instance gate: replicas set JELLYFIN_SKIP_MIGRATIONS and rely on a dedicated
++    // process (--mode MigrateSystem) to apply migrations before they are started.
++    private async Task EnsureNoPendingMigrationsAsync()
++    {
++        if (_skipGatePassed)
++        {
++            return;
++        }
++
++        var dbContext = await _dbContextFactory.CreateDbContextAsync().ConfigureAwait(false);
++        await using (dbContext.ConfigureAwait(false))
++        {
++            var appliedMigrations = (await dbContext.Database.GetAppliedMigrationsAsync().ConfigureAwait(false)).ToHashSet();
++            var pendingCount = (await dbContext.Database.GetPendingMigrationsAsync().ConfigureAwait(false)).Count()
++                + Migrations.SelectMany(e => e).Count(e => !appliedMigrations.Contains(e.BuildCodeMigrationId()));
++            if (pendingCount > 0)
++            {
++                throw new InvalidOperationException(string.Format(
++                    CultureInfo.InvariantCulture,
++                    "{0} is set but there are {1} pending migrations. Run the migration Job (--mode MigrateSystem) against this database, then start this instance again.",
++                    SkipMigrationsVariable,
++                    pendingCount));
++            }
++        }
++
++        _skipGatePassed = true;
++        _startupLogger.With(_loggerFactory.CreateLogger<JellyfinMigrationService>()).LogInformation("{EnvironmentVariable} is set and no migrations are pending. The migration machinery will not run in this process.", SkipMigrationsVariable);
++    }
++
+     public async Task CleanupSystemAfterMigration(ILogger logger)
+     {
+         if (_backupKey != default)
+-- 
+2.55.0
+

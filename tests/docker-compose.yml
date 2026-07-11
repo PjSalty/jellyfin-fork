@@ -1,0 +1,91 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: jellyfin
+      POSTGRES_USER: jellyfin
+      POSTGRES_PASSWORD: smoketest
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U jellyfin"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
+  # The PostgreSQL provider plugin comes from the sibling repo's public
+  # release (checksummed): the fork consumes the exact artifact users get.
+  plugin-fetch:
+    image: alpine:3.22
+    command:
+      - /bin/sh
+      - -c
+      - |
+        set -e
+        apk add --no-cache curl unzip >/dev/null
+        cd /tmp
+        VER=10.11.11-1-salty.1
+        curl -fsSLO https://github.com/PjSalty/jellyfin-pgsql/releases/download/$$VER/jellyfin-pgsql-$$VER.zip
+        curl -fsSLO https://github.com/PjSalty/jellyfin-pgsql/releases/download/$$VER/SHA256SUMS
+        sha256sum -c SHA256SUMS
+        mkdir -p /config/plugins/PostgreSQL
+        unzip -oq jellyfin-pgsql-$$VER.zip -d /config/plugins/PostgreSQL
+        echo "plugin staged"
+    volumes:
+      - config:/config
+
+  # Single-writer migration/seed pass (the pattern the Kubernetes Job uses),
+  # exercising patch 0001's --mode and proving replicas never need to migrate.
+  migrate:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: jellyfin-fork-smoke:local
+    command: ["--mode", "MigrateSystem"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+      plugin-fetch:
+        condition: service_completed_successfully
+    environment: &pgenv
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: jellyfin
+      POSTGRES_USER: jellyfin
+      POSTGRES_PASSWORD: smoketest
+    volumes:
+      - config:/config
+      - ./database.xml:/config/config/database.xml
+
+  jellyfin-leader:
+    image: jellyfin-fork-smoke:local
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *pgenv
+      JELLYFIN_ROLE: leader
+      JELLYFIN_SKIP_MIGRATIONS: "true"
+    volumes:
+      - config:/config
+      - ./database.xml:/config/config/database.xml
+    ports:
+      - "8096:8096"
+
+  jellyfin-replica:
+    image: jellyfin-fork-smoke:local
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    environment:
+      <<: *pgenv
+      JELLYFIN_ROLE: replica
+      JELLYFIN_SKIP_MIGRATIONS: "true"
+    volumes:
+      - config:/config
+      - ./database.xml:/config/config/database.xml
+    ports:
+      - "8097:8096"
+
+volumes:
+  # Shared /config mirrors the production target: phase 3 moves config to a
+  # shared RWX volume so wizard state, plugins, and metadata are one truth.
+  config:

@@ -1,0 +1,199 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sat, 11 Jul 2026 08:18:32 -0500
+Subject: [PATCH 4/5] replication: leader-gate background work
+
+Intent: JELLYFIN_ROLE unset or 'leader' behaves exactly like stock; any
+other value disarms scheduled-task triggers, trigger-originated scans,
+and LiveTV/DVR timer arming, with one startup log line stating the role
+and what is disarmed. Manual API-invoked runs work on any pod.
+Drop when: upstream ships first-class multi-instance roles.
+---
+ .../ScheduledTasks/ScheduledTaskWorker.cs     | 15 ++++++++++
+ .../ScheduledTasks/TaskManager.cs             | 10 +++++++
+ .../Replication/ReplicaRole.cs                | 30 +++++++++++++++++++
+ .../Recordings/RecordingsHost.cs              | 14 ++++++++-
+ src/Jellyfin.LiveTv/Timers/TimerManager.cs    |  7 +++++
+ 5 files changed, 75 insertions(+), 1 deletion(-)
+ create mode 100644 MediaBrowser.Common/Replication/ReplicaRole.cs
+
+diff --git a/Emby.Server.Implementations/ScheduledTasks/ScheduledTaskWorker.cs b/Emby.Server.Implementations/ScheduledTasks/ScheduledTaskWorker.cs
+index 24f5549..06230cb 100644
+--- a/Emby.Server.Implementations/ScheduledTasks/ScheduledTaskWorker.cs
++++ b/Emby.Server.Implementations/ScheduledTasks/ScheduledTaskWorker.cs
+@@ -13,6 +13,7 @@ using Jellyfin.Data.Events;
+ using Jellyfin.Extensions.Json;
+ using MediaBrowser.Common.Configuration;
+ using MediaBrowser.Common.Extensions;
++using MediaBrowser.Common.Replication;
+ using MediaBrowser.Model.Tasks;
+ using Microsoft.Extensions.Logging;
+ 
+@@ -238,6 +239,12 @@ public class ScheduledTaskWorker : IScheduledTaskWorker
+     /// <param name="isApplicationStartup">if set to <c>true</c> [is application startup].</param>
+     private void ReloadTriggerEvents(bool isApplicationStartup)
+     {
++        if (!ReplicaRole.IsLeader)
++        {
++            // Trigger arming is leader only. Manual execution through the task manager still works here.
++            return;
++        }
++
+         foreach (var triggerInfo in InternalTriggers)
+         {
+             var trigger = triggerInfo.Item2;
+@@ -259,6 +266,14 @@ public class ScheduledTaskWorker : IScheduledTaskWorker
+     {
+         var trigger = (ITaskTrigger)sender;
+ 
++        if (!ReplicaRole.IsLeader)
++        {
++            // Defense in depth, triggers never arm on a follower so this should not fire.
++            _logger.LogWarning("{Trigger} fired for task {Task} on a follower replica, ignoring. Triggered work runs on the leader only", trigger.GetType().Name, Name);
++            trigger.Stop();
++            return;
++        }
++
+         if (ScheduledTask is IConfigurableScheduledTask configurableTask && !configurableTask.IsEnabled)
+         {
+             return;
+diff --git a/Emby.Server.Implementations/ScheduledTasks/TaskManager.cs b/Emby.Server.Implementations/ScheduledTasks/TaskManager.cs
+index 4ec2c9c..b0981d7 100644
+--- a/Emby.Server.Implementations/ScheduledTasks/TaskManager.cs
++++ b/Emby.Server.Implementations/ScheduledTasks/TaskManager.cs
+@@ -5,6 +5,7 @@ using System.Linq;
+ using System.Threading.Tasks;
+ using Jellyfin.Data.Events;
+ using MediaBrowser.Common.Configuration;
++using MediaBrowser.Common.Replication;
+ using MediaBrowser.Model.Tasks;
+ using Microsoft.Extensions.Logging;
+ 
+@@ -37,6 +38,15 @@ public class TaskManager : ITaskManager
+         _logger = logger;
+ 
+         ScheduledTasks = [];
++
++        if (ReplicaRole.IsLeader)
++        {
++            _logger.LogInformation("Replica role is leader, scheduled task triggers will arm on this instance");
++        }
++        else
++        {
++            _logger.LogInformation("Replica role is follower, scheduled task triggers stay disarmed on this instance, manual task execution remains available");
++        }
+     }
+ 
+     /// <inheritdoc />
+diff --git a/MediaBrowser.Common/Replication/ReplicaRole.cs b/MediaBrowser.Common/Replication/ReplicaRole.cs
+new file mode 100644
+index 0000000..c7470e3
+--- /dev/null
++++ b/MediaBrowser.Common/Replication/ReplicaRole.cs
+@@ -0,0 +1,30 @@
++using System;
++
++namespace MediaBrowser.Common.Replication;
++
++/// <summary>
++/// Exposes the replication role of this server process.
++/// </summary>
++/// <remarks>
++/// The role is read once from the <c>JELLYFIN_ROLE</c> environment variable. A process is the
++/// leader when the variable is unset, which keeps single node deployments unchanged, or when it
++/// is set to <c>leader</c>. Followers serve requests but do not arm background work on their own.
++/// </remarks>
++public static class ReplicaRole
++{
++    /// <summary>
++    /// The name of the environment variable that configures the replication role.
++    /// </summary>
++    public const string EnvironmentVariableName = "JELLYFIN_ROLE";
++
++    /// <summary>
++    /// Gets a value indicating whether this process is the leader replica.
++    /// </summary>
++    public static bool IsLeader { get; } = ReadIsLeader();
++
++    private static bool ReadIsLeader()
++    {
++        var role = Environment.GetEnvironmentVariable(EnvironmentVariableName);
++        return string.IsNullOrEmpty(role) || string.Equals(role, "leader", StringComparison.OrdinalIgnoreCase);
++    }
++}
+diff --git a/src/Jellyfin.LiveTv/Recordings/RecordingsHost.cs b/src/Jellyfin.LiveTv/Recordings/RecordingsHost.cs
+index f4daa09..31e3af0 100644
+--- a/src/Jellyfin.LiveTv/Recordings/RecordingsHost.cs
++++ b/src/Jellyfin.LiveTv/Recordings/RecordingsHost.cs
+@@ -1,8 +1,10 @@
+ using System.Threading;
+ using System.Threading.Tasks;
+ using Jellyfin.LiveTv.Timers;
++using MediaBrowser.Common.Replication;
+ using MediaBrowser.Controller.LiveTv;
+ using Microsoft.Extensions.Hosting;
++using Microsoft.Extensions.Logging;
+ 
+ namespace Jellyfin.LiveTv.Recordings;
+ 
+@@ -13,21 +15,31 @@ public sealed class RecordingsHost : IHostedService
+ {
+     private readonly IRecordingsManager _recordingsManager;
+     private readonly TimerManager _timerManager;
++    private readonly ILogger<RecordingsHost> _logger;
+ 
+     /// <summary>
+     /// Initializes a new instance of the <see cref="RecordingsHost"/> class.
+     /// </summary>
+     /// <param name="recordingsManager">The <see cref="IRecordingsManager"/>.</param>
+     /// <param name="timerManager">The <see cref="TimerManager"/>.</param>
+-    public RecordingsHost(IRecordingsManager recordingsManager, TimerManager timerManager)
++    /// <param name="logger">The <see cref="ILogger{RecordingsHost}"/>.</param>
++    public RecordingsHost(IRecordingsManager recordingsManager, TimerManager timerManager, ILogger<RecordingsHost> logger)
+     {
+         _recordingsManager = recordingsManager;
+         _timerManager = timerManager;
++        _logger = logger;
+     }
+ 
+     /// <inheritdoc />
+     public Task StartAsync(CancellationToken cancellationToken)
+     {
++        if (!ReplicaRole.IsLeader)
++        {
++            _logger.LogInformation("Replica role is follower, Live TV recording timers stay disarmed on this instance");
++            return Task.CompletedTask;
++        }
++
++        _logger.LogInformation("Replica role is leader, Live TV recording timers will arm on this instance");
+         _timerManager.RestartTimers();
+         return _recordingsManager.CreateRecordingFolders();
+     }
+diff --git a/src/Jellyfin.LiveTv/Timers/TimerManager.cs b/src/Jellyfin.LiveTv/Timers/TimerManager.cs
+index 1cf3351..fdc0651 100644
+--- a/src/Jellyfin.LiveTv/Timers/TimerManager.cs
++++ b/src/Jellyfin.LiveTv/Timers/TimerManager.cs
+@@ -9,6 +9,7 @@ using System.Threading;
+ using Jellyfin.Data.Events;
+ using Jellyfin.LiveTv.Recordings;
+ using MediaBrowser.Common.Configuration;
++using MediaBrowser.Common.Replication;
+ using MediaBrowser.Controller.LiveTv;
+ using MediaBrowser.Model.LiveTv;
+ using Microsoft.Extensions.Logging;
+@@ -88,6 +89,12 @@ namespace Jellyfin.LiveTv.Timers
+ 
+         private void AddOrUpdateSystemTimer(TimerInfo item)
+         {
++            if (!ReplicaRole.IsLeader)
++            {
++                // Followers keep timer data in sync but never arm the in-process recording timers.
++                return;
++            }
++
+             StopTimer(item);
+ 
+             if (item.Status is RecordingStatus.Completed or RecordingStatus.Cancelled)
+-- 
+2.55.0
+

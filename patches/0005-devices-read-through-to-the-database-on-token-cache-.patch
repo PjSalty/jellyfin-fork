@@ -1,0 +1,70 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sat, 11 Jul 2026 08:18:32 -0500
+Subject: [PATCH 5/5] devices: read through to the database on token cache miss
+
+Intent: tokens minted by another replica authenticate here: the device/
+token lookup re-checks the database once on a cache miss and populates
+the cache, rejecting only when the database also misses.
+Drop when: upstream makes the token path DB-backed.
+---
+ .../Devices/DeviceManager.cs                  | 36 +++++++++++++++----
+ 1 file changed, 29 insertions(+), 7 deletions(-)
+
+diff --git a/Jellyfin.Server.Implementations/Devices/DeviceManager.cs b/Jellyfin.Server.Implementations/Devices/DeviceManager.cs
+index 51a1186..f76bb11 100644
+--- a/Jellyfin.Server.Implementations/Devices/DeviceManager.cs
++++ b/Jellyfin.Server.Implementations/Devices/DeviceManager.cs
+@@ -145,13 +145,25 @@ namespace Jellyfin.Server.Implementations.Devices
+         /// <inheritdoc />
+         public QueryResult<Device> GetDevices(DeviceQuery query)
+         {
+-            IEnumerable<Device> devices = _devices.Values
+-                .Where(device => !query.UserId.HasValue || device.UserId.Equals(query.UserId.Value))
+-                .Where(device => query.DeviceId is null || device.DeviceId == query.DeviceId)
+-                .Where(device => query.AccessToken is null || device.AccessToken == query.AccessToken)
+-                .OrderBy(d => d.Id)
+-                .ToList();
+-            var count = devices.Count();
++            var cached = GetCachedDevices(query);
++
++            if (query.AccessToken is not null && cached.Count == 0)
++            {
++                // A token minted by another server instance sharing this database is not in
++                // the startup cache. Read through to the database once before rejecting it.
++                using var dbContext = _dbProvider.CreateDbContext();
++                foreach (var device in dbContext.Devices
++                             .Where(d => d.AccessToken == query.AccessToken)
++                             .AsEnumerable())
++                {
++                    _devices.TryAdd(device.Id, device);
++                }
++
++                cached = GetCachedDevices(query);
++            }
++
++            IEnumerable<Device> devices = cached;
++            var count = cached.Count;
+ 
+             if (query.Skip.HasValue)
+             {
+@@ -166,6 +178,16 @@ namespace Jellyfin.Server.Implementations.Devices
+             return new QueryResult<Device>(query.Skip, count, devices.ToList());
+         }
+ 
++        private List<Device> GetCachedDevices(DeviceQuery query)
++        {
++            return _devices.Values
++                .Where(device => !query.UserId.HasValue || device.UserId.Equals(query.UserId.Value))
++                .Where(device => query.DeviceId is null || device.DeviceId == query.DeviceId)
++                .Where(device => query.AccessToken is null || device.AccessToken == query.AccessToken)
++                .OrderBy(d => d.Id)
++                .ToList();
++        }
++
+         /// <inheritdoc />
+         public QueryResult<DeviceInfo> GetDeviceInfos(DeviceQuery query)
+         {
+-- 
+2.55.0
+

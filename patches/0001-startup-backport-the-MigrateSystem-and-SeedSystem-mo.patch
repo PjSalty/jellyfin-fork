@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sat, 11 Jul 2026 07:44:53 -0500
+Subject: [PATCH 1/5] startup: backport the MigrateSystem and SeedSystem modes
+
+Intent: --mode MigrateSystem runs migrations and exits, --mode SeedSystem
+seeds and exits; a Kubernetes Job becomes the single migration writer so
+N replicas can boot with migrations gated off.
+Upstream: jellyfin/jellyfin PR 16319, merged for the 12.0 line.
+Drop when: UPSTREAM_REF moves to a base that contains it.
+---
+ Jellyfin.Server/Configuration/StartupMode.cs  | 24 +++++++++++++
+ .../Migrations/JellyfinMigrationService.cs    |  6 ++--
+ Jellyfin.Server/Program.cs                    | 34 +++++++++++++------
+ Jellyfin.Server/StartupOptions.cs             |  8 +++++
+ .../JellyfinApplicationFactory.cs             |  2 +-
+ 5 files changed, 59 insertions(+), 15 deletions(-)
+ create mode 100644 Jellyfin.Server/Configuration/StartupMode.cs
+
+diff --git a/Jellyfin.Server/Configuration/StartupMode.cs b/Jellyfin.Server/Configuration/StartupMode.cs
+new file mode 100644
+index 0000000..e1d18f1
+--- /dev/null
++++ b/Jellyfin.Server/Configuration/StartupMode.cs
+@@ -0,0 +1,24 @@
++using MediaBrowser.Model.Configuration;
++
++namespace Jellyfin.Server.Configuration;
++
++/// <summary>
++/// Defines types for usage with the <see cref="StartupOptions.StartupMode"/>.
++/// </summary>
++public enum StartupMode
++{
++    /// <summary>
++    /// Default startup mode, runs the jellyfin server in normal operation.
++    /// </summary>
++    MediaServer = 0,
++
++    /// <summary>
++    /// Attempts to Migrate the system only then shuts down.
++    /// </summary>
++    MigrateSystem = 1,
++
++    /// <summary>
++    /// Runs the Database seed function regardless of <see cref="BaseApplicationConfiguration.IsStartupWizardCompleted"/> state.
++    /// </summary>
++    SeedSystem = 2
++}
+diff --git a/Jellyfin.Server/Migrations/JellyfinMigrationService.cs b/Jellyfin.Server/Migrations/JellyfinMigrationService.cs
+index 188d3c4..d664b71 100644
+--- a/Jellyfin.Server/Migrations/JellyfinMigrationService.cs
++++ b/Jellyfin.Server/Migrations/JellyfinMigrationService.cs
+@@ -90,7 +90,7 @@ internal class JellyfinMigrationService
+ 
+     private HashSet<MigrationStage> Migrations { get; set; }
+ 
+-    public async Task CheckFirstTimeRunOrMigration(IApplicationPaths appPaths)
++    public async Task CheckFirstTimeRunOrMigration(IApplicationPaths appPaths, StartupOptions startupOptions)
+     {
+         var logger = _startupLogger.With(_loggerFactory.CreateLogger<JellyfinMigrationService>()).BeginGroup($"Migration Startup");
+         logger.LogInformation("Initialise Migration service.");
+@@ -98,9 +98,9 @@ internal class JellyfinMigrationService
+         var serverConfig = File.Exists(appPaths.SystemConfigurationFilePath)
+             ? (ServerConfiguration)xmlSerializer.DeserializeFromFile(typeof(ServerConfiguration), appPaths.SystemConfigurationFilePath)!
+             : new ServerConfiguration();
+-        if (!serverConfig.IsStartupWizardCompleted)
++        if (!serverConfig.IsStartupWizardCompleted || startupOptions.StartupMode is Configuration.StartupMode.SeedSystem)
+         {
+-            logger.LogInformation("System initialisation detected. Seed data.");
++            logger.LogInformation("System initialization detected. Seed data. Startup mode is: {StartupMode}", startupOptions.StartupMode ?? Configuration.StartupMode.MediaServer);
+             var flatApplyMigrations = Migrations.SelectMany(e => e.Where(f => !f.Metadata.RunMigrationOnSetup)).ToArray();
+ 
+             var dbContext = await _dbContextFactory.CreateDbContextAsync().ConfigureAwait(false);
+diff --git a/Jellyfin.Server/Program.cs b/Jellyfin.Server/Program.cs
+index 93f71fd..248f61d 100644
+--- a/Jellyfin.Server/Program.cs
++++ b/Jellyfin.Server/Program.cs
+@@ -137,7 +137,7 @@ namespace Jellyfin.Server
+ 
+             StartupHelpers.PerformStaticInitialization();
+ 
+-            await ApplyStartupMigrationAsync(appPaths, startupConfig).ConfigureAwait(false);
++            await ApplyStartupMigrationAsync(appPaths, startupConfig, options).ConfigureAwait(false);
+ 
+             do
+             {
+@@ -214,13 +214,17 @@ namespace Jellyfin.Server
+                 {
+                     configurationCompleted = true;
+                     await _setupServer!.StopAsync().ConfigureAwait(false);
+-                    await _jellyfinHost.StartAsync().ConfigureAwait(false);
+ 
+-                    if (!OperatingSystem.IsWindows() && startupConfig.UseUnixSocket())
++                    if (options.StartupMode is null or Configuration.StartupMode.MediaServer)
+                     {
+-                        var socketPath = StartupHelpers.GetUnixSocketPath(startupConfig, appPaths);
++                        await _jellyfinHost.StartAsync().ConfigureAwait(false);
+ 
+-                        StartupHelpers.SetUnixSocketPermissions(startupConfig, socketPath, _logger);
++                        if (!OperatingSystem.IsWindows() && startupConfig.UseUnixSocket())
++                        {
++                            var socketPath = StartupHelpers.GetUnixSocketPath(startupConfig, appPaths);
++
++                            StartupHelpers.SetUnixSocketPermissions(startupConfig, socketPath, _logger);
++                        }
+                     }
+                 }
+                 catch (Exception)
+@@ -229,11 +233,14 @@ namespace Jellyfin.Server
+                     throw;
+                 }
+ 
+-                await appHost.RunStartupTasksAsync().ConfigureAwait(false);
++                if (options.StartupMode is null or Configuration.StartupMode.MediaServer)
++                {
++                    await appHost.RunStartupTasksAsync().ConfigureAwait(false);
++                    _logger.LogInformation("Startup complete {Time:g}", Stopwatch.GetElapsedTime(_startTimestamp));
+ 
+-                _logger.LogInformation("Startup complete {Time:g}", Stopwatch.GetElapsedTime(_startTimestamp));
++                    await _jellyfinHost.WaitForShutdownAsync().ConfigureAwait(false);
++                }
+ 
+-                await _jellyfinHost.WaitForShutdownAsync().ConfigureAwait(false);
+                 _restartOnShutdown = appHost.ShouldRestart;
+                 _restoreFromBackup = appHost.RestoreBackupPath;
+             }
+@@ -244,7 +251,11 @@ namespace Jellyfin.Server
+                 if (_setupServer!.IsAlive && !configurationCompleted)
+                 {
+                     _setupServer!.SoftStop();
+-                    await Task.Delay(TimeSpan.FromMinutes(10)).ConfigureAwait(false);
++                    if (options.StartupMode is null or Configuration.StartupMode.MediaServer)
++                    {
++                        await Task.Delay(TimeSpan.FromMinutes(10)).ConfigureAwait(false);
++                    }
++
+                     await _setupServer!.StopAsync().ConfigureAwait(false);
+                 }
+             }
+@@ -274,8 +285,9 @@ namespace Jellyfin.Server
+         /// </remarks>
+         /// <param name="appPaths">Application Paths.</param>
+         /// <param name="startupConfig">Startup Config.</param>
++        /// <param name="startupOptions">The applications startup options.</param>
+         /// <returns>A task.</returns>
+-        public static async Task ApplyStartupMigrationAsync(ServerApplicationPaths appPaths, IConfiguration startupConfig)
++        public static async Task ApplyStartupMigrationAsync(ServerApplicationPaths appPaths, IConfiguration startupConfig, StartupOptions startupOptions)
+         {
+             _migrationLogger = StartupLogger.Logger.BeginGroup<JellyfinMigrationService>($"Migration Service");
+             var startupConfigurationManager = new ServerConfigurationManager(appPaths, _loggerFactory, new MyXmlSerializer());
+@@ -293,7 +305,7 @@ namespace Jellyfin.Server
+             PrepareDatabaseProvider(startupService);
+ 
+             var jellyfinMigrationService = ActivatorUtilities.CreateInstance<JellyfinMigrationService>(startupService);
+-            await jellyfinMigrationService.CheckFirstTimeRunOrMigration(appPaths).ConfigureAwait(false);
++            await jellyfinMigrationService.CheckFirstTimeRunOrMigration(appPaths, startupOptions).ConfigureAwait(false);
+             await jellyfinMigrationService.MigrateStepAsync(Migrations.Stages.JellyfinMigrationStageTypes.PreInitialisation, startupService).ConfigureAwait(false);
+         }
+ 
+diff --git a/Jellyfin.Server/StartupOptions.cs b/Jellyfin.Server/StartupOptions.cs
+index 4890ccb..4716bc1 100644
+--- a/Jellyfin.Server/StartupOptions.cs
++++ b/Jellyfin.Server/StartupOptions.cs
+@@ -1,6 +1,7 @@
+ using System.Collections.Generic;
+ using CommandLine;
+ using Emby.Server.Implementations;
++using Jellyfin.Server.Configuration;
+ using static MediaBrowser.Controller.Extensions.ConfigurationExtensions;
+ 
+ namespace Jellyfin.Server
+@@ -79,6 +80,13 @@ namespace Jellyfin.Server
+         [Option("restore-archive", Required = false, HelpText = "Path to a Jellyfin backup archive to restore from")]
+         public string? RestoreArchive { get; set; }
+ 
++        /// <summary>
++        /// Gets or sets the mode of operation the server should perform when started.
++        /// Defaults to: <see cref="StartupMode.MediaServer"/>.
++        /// </summary>
++        [Option("mode", Required = false, HelpText = "Mode which selects what action the jellyfin server should perform when started.")]
++        public StartupMode? StartupMode { get; set; }
++
+         /// <summary>
+         /// Gets the command line options as a dictionary that can be used in the .NET configuration system.
+         /// </summary>
+diff --git a/tests/Jellyfin.Server.Integration.Tests/JellyfinApplicationFactory.cs b/tests/Jellyfin.Server.Integration.Tests/JellyfinApplicationFactory.cs
+index 0952fb8..54f443d 100644
+--- a/tests/Jellyfin.Server.Integration.Tests/JellyfinApplicationFactory.cs
++++ b/tests/Jellyfin.Server.Integration.Tests/JellyfinApplicationFactory.cs
+@@ -111,7 +111,7 @@ namespace Jellyfin.Server.Integration.Tests
+             var appHost = (TestAppHost)host.Services.GetRequiredService<IApplicationHost>();
+             appHost.ServiceProvider = host.Services;
+             var applicationPaths = appHost.ServiceProvider.GetRequiredService<IApplicationPaths>();
+-            Program.ApplyStartupMigrationAsync((ServerApplicationPaths)applicationPaths, appHost.ServiceProvider.GetRequiredService<IConfiguration>()).GetAwaiter().GetResult();
++            Program.ApplyStartupMigrationAsync((ServerApplicationPaths)applicationPaths, appHost.ServiceProvider.GetRequiredService<IConfiguration>(), new()).GetAwaiter().GetResult();
+             Program.ApplyCoreMigrationsAsync(appHost.ServiceProvider, Migrations.Stages.JellyfinMigrationStageTypes.CoreInitialisation).GetAwaiter().GetResult();
+             appHost.InitializeServices(Mock.Of<IConfiguration>()).GetAwaiter().GetResult();
+             Program.ApplyCoreMigrationsAsync(appHost.ServiceProvider, Migrations.Stages.JellyfinMigrationStageTypes.AppInitialisation).GetAwaiter().GetResult();
+-- 
+2.55.0
+
