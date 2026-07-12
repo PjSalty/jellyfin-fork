@@ -52,8 +52,10 @@ wait_healthy "${LEADER_URL}" || die "leader never became healthy"
 wait_healthy "${REPLICA_URL}" || die "replica never became healthy"
 
 info "asserting the skip-gate engaged on both serving pods"
-${COMPOSE} logs jellyfin-leader | grep -i "skip" | grep -qi "migration" || die "leader skip-gate log line missing"
-${COMPOSE} logs jellyfin-replica | grep -i "skip" | grep -qi "migration" || die "replica skip-gate log line missing"
+# Exact phrase from patch 0002; plain grep drains the stream (grep -q closes
+# the pipe early and pipefail then fails on compose logs' SIGPIPE).
+${COMPOSE} logs jellyfin-leader | grep "migration machinery will not run" > /dev/null || die "leader skip-gate log line missing"
+${COMPOSE} logs jellyfin-replica | grep "migration machinery will not run" > /dev/null || die "replica skip-gate log line missing"
 
 info "completing the startup wizard on the leader"
 wizard() {
@@ -88,6 +90,7 @@ curl -sf "${LEADER_URL}/Users/${user_id}/Items?Recursive=true" -H "X-Emby-Token:
 curl -sf "${REPLICA_URL}/Users/${user_id}/Items?Recursive=true" -H "X-Emby-Token: ${token}" > /dev/null || die "browse failed on replica"
 
 info "asserting the replica disarmed background work"
-${COMPOSE} logs jellyfin-replica | grep -qiE "follower|disarm|replica role" || die "replica role log line missing"
+# Exact phrase from patch 0004.
+${COMPOSE} logs jellyfin-replica | grep "scheduled task triggers stay disarmed" > /dev/null || die "replica role log line missing"
 
 info "PASS"
