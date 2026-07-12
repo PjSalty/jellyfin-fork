@@ -1,0 +1,44 @@
+# Baked defaults for the rffmpeg dispatch path. Inert until (a) something
+# invokes the ffmpeg-dispatch/ffprobe-dispatch shims instead of the bundled
+# jellyfin-ffmpeg and (b) `rffmpeg init` + `rffmpeg add` registered a worker.
+# Stock deployments never touch either. Key material and known_hosts mount
+# at /etc/rffmpeg/ssh/; override this whole file by mounting your own at
+# /etc/rffmpeg/rffmpeg.yml.
+rffmpeg:
+  logging:
+    log_to_file: true
+    logfile: "/config/log/rffmpeg.log"
+    debug: false
+  directories:
+    state: "/var/lib/rffmpeg"
+    # /dev/shm, not the upstream-default /run/shm: slim containers don't
+    # carry the /run/shm symlink and ssh ControlPath dies without the dir.
+    persist: "/dev/shm"
+    # The official image runs the server as root; init chowns state to this.
+    owner: root
+    group: root
+  remote:
+    user: rffmpeg
+    persist: 300
+    args:
+      - "-p"
+      - "2222"
+      - "-i"
+      - "/etc/rffmpeg/ssh/id_ed25519"
+      - "-o"
+      - "UserKnownHostsFile=/etc/rffmpeg/ssh/known_hosts"
+      - "-o"
+      - "StrictHostKeyChecking=yes"
+      # Short connect timeout so a dead worker degrades to the local encoder
+      # in seconds, not TCP-default minutes.
+      - "-o"
+      - "ConnectTimeout=3"
+  commands:
+    ssh: "/usr/bin/ssh"
+    # Remote paths on the worker; the worker ships the same jellyfin-ffmpeg.
+    ffmpeg: "/usr/lib/jellyfin-ffmpeg/ffmpeg"
+    ffprobe: "/usr/lib/jellyfin-ffmpeg/ffprobe"
+    # Local fallback: the image's own encoder, so losing every worker costs
+    # performance, never playback.
+    fallback_ffmpeg: "/usr/lib/jellyfin-ffmpeg/ffmpeg"
+    fallback_ffprobe: "/usr/lib/jellyfin-ffmpeg/ffprobe"
