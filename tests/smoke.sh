@@ -5,7 +5,8 @@
 #              then a leader and a replica boot with migrations gated off.
 #              Asserts: both healthy, wizard on the leader, a token minted on
 #              the leader authenticates on the replica (read-through), browse
-#              works on both, and the replica armed no scheduled tasks.
+#              works on both, the replica armed no scheduled tasks, and the
+#              rffmpeg shims dispatch to a worker then fall back locally.
 # Usage: ./tests/smoke.sh   (expects ../upstream to be assembled, see build/assemble.sh)
 #
 
@@ -25,7 +26,7 @@ die()  { echo "[smoke] FAIL: $*" >&2; exit 1; }
 cleanup() {
     rc=$?
     if [ "${rc}" -ne 0 ]; then
-        for svc in migrate jellyfin-leader jellyfin-replica; do
+        for svc in migrate jellyfin-leader jellyfin-replica transcode-worker; do
             echo "[smoke] ${svc} logs (last 120 lines, health spam filtered):" >&2
             ${COMPOSE} logs "${svc}" 2>/dev/null | grep -viE 'healthcheckservice|health check' | tail -120 >&2 || true
         done
@@ -45,6 +46,17 @@ wait_healthy() {
     done
     return 1
 }
+
+info "generating dispatch ssh keys"
+# Generated inside a container: the GitLab dind runner image has no
+# ssh-keygen, and docker is a given for this test anyway.
+docker run --rm -v "${TESTS_DIR}/.sshkeys:/keys" alpine:3.22 sh -c '
+    apk add --no-cache openssh-keygen >/dev/null
+    [ -f /keys/id_ed25519 ] || ssh-keygen -q -t ed25519 -N "" -f /keys/id_ed25519
+    [ -f /keys/ssh_host_ed25519_key ] || ssh-keygen -q -t ed25519 -N "" -f /keys/ssh_host_ed25519_key
+    printf "[transcode-worker]:2222 %s\n" "$(cut -d" " -f1-2 /keys/ssh_host_ed25519_key.pub)" > /keys/known_hosts
+    chmod 644 /keys/known_hosts /keys/*.pub
+' || die "ssh key generation failed"
 
 info "starting stack (builds the patched server image, runs the migrate pass)"
 ${COMPOSE} up -d --build
@@ -92,5 +104,24 @@ curl -sf "${REPLICA_URL}/Users/${user_id}/Items?Recursive=true" -H "X-Emby-Token
 info "asserting the replica disarmed background work"
 # Exact phrase from patch 0004.
 ${COMPOSE} logs jellyfin-replica | grep "scheduled task triggers stay disarmed" > /dev/null || die "replica role log line missing"
+
+info "dispatch: registering the worker with rffmpeg on the leader"
+${COMPOSE} exec -T jellyfin-leader rffmpeg init -y > /dev/null || die "rffmpeg init failed"
+${COMPOSE} exec -T jellyfin-leader rffmpeg add transcode-worker > /dev/null || die "rffmpeg add failed"
+
+info "dispatch: encoding through the shim (must land on the worker)"
+${COMPOSE} exec -T jellyfin-leader ffmpeg-dispatch \
+    -f lavfi -i testsrc=duration=1:size=320x240:rate=10 \
+    -c:v libx264 -f null - > /dev/null 2>&1 || die "dispatched encode failed"
+${COMPOSE} exec -T jellyfin-leader cat /config/log/rffmpeg.log \
+    | grep "Running command on host 'transcode-worker'" > /dev/null \
+    || die "encode did not dispatch to the worker"
+
+info "dispatch: stopping the worker; the shim must fall back to local ffmpeg"
+${COMPOSE} stop transcode-worker > /dev/null 2>&1
+${COMPOSE} exec -T jellyfin-leader ffprobe-dispatch -version > /dev/null 2>&1 || die "fallback ffprobe failed"
+${COMPOSE} exec -T jellyfin-leader tail -20 /config/log/rffmpeg.log \
+    | grep "Running command on host 'localhost'" > /dev/null \
+    || die "fallback did not engage"
 
 info "PASS"

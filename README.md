@@ -15,6 +15,12 @@ This is an overlay build, not a diverged fork: `UPSTREAM_REF` pins the upstream 
 
 Unset `JELLYFIN_ROLE` and everything behaves exactly like stock Jellyfin: the gates only close when you opt a pod into being a follower.
 
+## Remote transcoding (optional)
+
+The image bundles [rffmpeg](https://github.com/joshuaboniface/rffmpeg) (pinned by commit and checksum, since upstream tags no releases) as `ffmpeg-dispatch` / `ffprobe-dispatch`. Point Jellyfin's ffmpeg path at `/usr/local/bin/ffmpeg-dispatch` and encodes run on a remote worker over ssh, with the serving pod's own jellyfin-ffmpeg as automatic fallback: one GPU box can serve every replica, and losing it costs performance, never playback.
+
+To wire it up: mount a client key and `known_hosts` at `/etc/rffmpeg/ssh/`, run `rffmpeg init -y && rffmpeg add <worker>` once per container (an initContainer in Kubernetes), and run sshd on the worker for user `rffmpeg` on port 2222 with jellyfin-ffmpeg at its standard path (`tests/worker/` is a working reference). Baked defaults live in `docker/rffmpeg.yml`; mount your own file over it to change them. Don't touch any of this and the image encodes locally, exactly like stock.
+
 ## Build
 
 ```bash

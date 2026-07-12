@@ -42,6 +42,28 @@ RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get install -y --no-install-recommends postgresql-client-16 \
     && rm -rf /var/lib/apt/lists/*
 
+# rffmpeg dispatch shims: ffmpeg-dispatch/ffprobe-dispatch route encodes to
+# a remote worker over ssh, falling back to the local jellyfin-ffmpeg when
+# no worker answers. rffmpeg ships no releases (upstream says use master),
+# so the pin is a commit SHA guarded by a content checksum. Inert unless the
+# encoder path is pointed at the shims.
+ARG RFFMPEG_COMMIT=f54ac843c7c8a157562e7ce37aaebbc5cb41354e
+ARG RFFMPEG_SHA256=d56929577e69a1f2d0928c103d0fd4d334c2b091fa09941cc0d4624ffddc0017
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+       python3 python3-click python3-yaml openssh-client \
+    && rm -rf /var/lib/apt/lists/* \
+    && curl -fsSL "https://raw.githubusercontent.com/joshuaboniface/rffmpeg/${RFFMPEG_COMMIT}/rffmpeg" \
+       -o /usr/local/bin/rffmpeg \
+    && echo "${RFFMPEG_SHA256}  /usr/local/bin/rffmpeg" | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/rffmpeg \
+    # argv[0] routing: a name containing "rffmpeg" enters CLI mode, one
+    # containing "ffprobe" probes, anything else transcodes; hence these names.
+    && ln -s /usr/local/bin/rffmpeg /usr/local/bin/ffmpeg-dispatch \
+    && ln -s /usr/local/bin/rffmpeg /usr/local/bin/ffprobe-dispatch \
+    && mkdir -p /etc/rffmpeg/ssh /var/lib/rffmpeg
+COPY docker/rffmpeg.yml /etc/rffmpeg/rffmpeg.yml
+
 # The official image keeps the server in /jellyfin with web at
 # /jellyfin/jellyfin-web; replace the server payload, preserve the web client.
 RUN mv /jellyfin/jellyfin-web /tmp/jellyfin-web-keep \

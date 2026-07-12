@@ -1,0 +1,19 @@
+# Locked-down sshd for the dispatch fixture: key-only, one user, no
+# forwarding. sshd_config.d is included first and OpenSSH keeps the first
+# value per keyword, so these win over the stock config.
+Port 2222
+AddressFamily inet
+HostKey /etc/ssh/hostkeys/ssh_host_ed25519_key
+AllowUsers rffmpeg
+AuthenticationMethods publickey
+PasswordAuthentication no
+KbdInteractiveAuthentication no
+PermitRootLogin no
+AllowTcpForwarding no
+AllowAgentForwarding no
+X11Forwarding no
+PermitTunnel no
+AuthorizedKeysFile /home/rffmpeg/.ssh/authorized_keys
+# Bind-mounted key material arrives with arbitrary uid/mode in CI; a strict
+# ownership check would reject it. Fixture-only relaxation.
+StrictModes no
