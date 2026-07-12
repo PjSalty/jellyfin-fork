@@ -1,0 +1,29 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Self-contained on purpose: this tree is public, so no private preset references.",
+    "An UPSTREAM_REF bump is a release event for the overlay: CI reassembles from the new tag, git am names the first conflicting patch, and the smoke proves the multi-replica contract. Review, never automerge.",
+    "The BASE_IMAGE ARG in docker/Dockerfile is covered by the built-in dockerfile manager; keep it in lockstep with UPSTREAM_REF in the same MR."
+  ],
+  "timezone": "America/New_York",
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Pinned upstream jellyfin release the overlay reassembles from",
+      "managerFilePatterns": ["/^UPSTREAM_REF$/"],
+      "matchStrings": ["(?<currentValue>v\\d+\\.\\d+\\.\\d+)"],
+      "depNameTemplate": "jellyfin/jellyfin",
+      "datasourceTemplate": "github-tags"
+    }
+  ],
+  "packageRules": [
+    {
+      "matchDepNames": ["jellyfin/jellyfin"],
+      "automerge": false
+    },
+    {
+      "matchDatasources": ["docker"],
+      "automerge": false
+    }
+  ]
+}
