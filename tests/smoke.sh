@@ -101,6 +101,38 @@ info "browsing on both pods"
 curl -sf "${LEADER_URL}/Users/${user_id}/Items?Recursive=true" -H "X-Emby-Token: ${token}" > /dev/null || die "browse failed on leader"
 curl -sf "${REPLICA_URL}/Users/${user_id}/Items?Recursive=true" -H "X-Emby-Token: ${token}" > /dev/null || die "browse failed on replica"
 
+info "asserting a user update DELETES old permissions instead of orphaning them (patch 0006)"
+# Regression guard. Permission.UserId / Preference.UserId are Guid? (optional), so
+# UpdateUserAsync's dbUser.Permissions.Clear() makes EF SEVER the relationship
+# (UPDATE ... SET "UserId" = NULL) rather than delete the rows. Unpatched, every call
+# strands the user's whole permission set as unreachable NULL-UserId rows: invisible to
+# the app (queries filter on UserId; NULL matches nothing) and to UNIQUE(UserId, Kind)
+# (a btree treats NULLs as distinct). Prod reached 29,637 orphans against 407 live rows.
+#
+# ForgotPassword is the one in-tree caller of UpdateUserAsync reachable over the API, so
+# it is the trigger. Unpatched, this assertion fails with 24 orphaned permissions.
+pgq() {
+    ${COMPOSE} exec -T postgres psql -U jellyfin -d jellyfin -qAt -c "$1" | tr -d '[:space:]'
+}
+orphans_before="$(pgq 'SELECT count(*) FROM "Permissions" WHERE "UserId" IS NULL;')"
+[ "${orphans_before}" = "0" ] || die "started dirty: ${orphans_before} orphaned permission rows before the update"
+
+curl -sf -X POST "${LEADER_URL}/Users/ForgotPassword" \
+    -H 'Content-Type: application/json' -d '{"EnteredUsername":"smoke"}' > /dev/null \
+    || die "ForgotPassword (the UpdateUserAsync trigger) failed"
+
+orphans_after="$(pgq 'SELECT count(*) FROM "Permissions" WHERE "UserId" IS NULL;')"
+pref_orphans="$(pgq 'SELECT count(*) FROM "Preferences" WHERE "UserId" IS NULL;')"
+[ "${orphans_after}" = "0" ] \
+    || die "user update orphaned ${orphans_after} permission rows (severed to NULL UserId instead of deleted)"
+[ "${pref_orphans}" = "0" ] \
+    || die "user update orphaned ${pref_orphans} preference rows (severed to NULL UserId instead of deleted)"
+
+# The user must still HAVE its permissions: deleting too much is the other failure mode.
+live_perms="$(pgq 'SELECT count(*) FROM "Permissions" WHERE "UserId" IS NOT NULL;')"
+[ "${live_perms}" -gt 0 ] \
+    || die "user update deleted the live permission rows too (${live_perms} remain): access control is broken"
+
 info "asserting the replica disarmed background work"
 # Exact phrase from patch 0004.
 ${COMPOSE} logs jellyfin-replica | grep "scheduled task triggers stay disarmed" > /dev/null || die "replica role log line missing"

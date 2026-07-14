@@ -9,6 +9,7 @@ Everything this repo changes relative to [jellyfin/jellyfin](https://github.com/
 | `0003-items-make-the-ItemValues-get-or-create-concurrency-.patch` | port of upstream PR 17119: ItemValues get-or-create made concurrency-safe under parallel item saves | UPSTREAM_REF contains PR 17119 (lands in the ItemPersistenceService refactor line) |
 | `0004-replication-leader-gate-background-work.patch` | leader gating: scheduled task triggers, trigger-originated scans, and LiveTV/DVR timer arming run only where `JELLYFIN_ROLE` is unset or `leader` | upstream ships first-class multi-instance roles |
 | `0005-devices-read-through-to-the-database-on-token-cache-.patch` | device token read-through: token cache misses re-check the database before rejecting, so tokens minted by another replica work | upstream makes the token path DB-backed |
+| `0006-users-delete-permissions-and-preferences-on-update-in.patch` | `UpdateUserAsync` deletes the user's old Permissions/Preferences instead of orphaning them. `Permission.UserId` is `Guid?` (optional), so `Clear()` makes EF *sever* (`SET "UserId" = NULL`) rather than delete; every call stranded 24+13 unreachable rows. Upstream bug, not multi-replica-specific: SQLite installs leak the same rows | upstream fixes it (report/PR filed) |
 
 Image-layer divergence (no server patch involved):
 
