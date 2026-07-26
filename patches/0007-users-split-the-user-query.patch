@@ -1,0 +1,52 @@
+From d9b87c8f658cbd50f5773f49301bdc97405aeb64 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sat, 25 Jul 2026 23:21:17 -0500
+Subject: [PATCH 7/7] users: split the user query so sibling collections stop
+ multiplying
+
+UserQuery uses AsSingleQuery over three SIBLING collections (Permissions,
+Preferences, AccessSchedules), so EF emits one query that JOINs them and returns
+their cartesian product. Each user carries ~24 permissions x ~13 preferences, so
+loading a single user materialises ~312 rows of duplicated user columns to build
+one User object, and loading all 11 users returned 3,432 rows.
+
+AsSplitQuery is the documented remedy for this shape. Measured on a live server:
+  GetUserById  12.13ms -> 2.27ms per load (5.3x, 3 round trips included)
+  GetUsers     3,432 rows / 70.2ms -> 418 rows / 4.36ms (16x)
+
+These two statements were #1 and #2 in the database by cumulative execution time
+(24,722s of the top-8 total of 40,000s), because 5-19 user loads fire per grid
+page request. Split queries do not change results here: all four navigations are
+independent collections off the same root, loaded read-only (AsNoTracking).
+---
+ .../Users/UserManager.cs                         | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/Jellyfin.Server.Implementations/Users/UserManager.cs b/Jellyfin.Server.Implementations/Users/UserManager.cs
+index 656a2b4..60588b5 100644
+--- a/Jellyfin.Server.Implementations/Users/UserManager.cs
++++ b/Jellyfin.Server.Implementations/Users/UserManager.cs
+@@ -134,8 +134,22 @@ namespace Jellyfin.Server.Implementations.Users
+ 
+         private static IQueryable<User> UserQuery(JellyfinDbContext dbContext)
+         {
++            // AsSplitQuery, not AsSingleQuery: Permissions, Preferences and
++            // AccessSchedules are three SIBLING collections, so a single query
++            // JOINs them together and returns their cartesian product. Every
++            // user carries ~24 permissions x ~13 preferences, so loading one
++            // user materialises ~312 rows of duplicated user columns to produce
++            // one User object, and loading all 11 users returned 3,432 rows.
++            //
++            // This is the documented EF Core remedy for exactly this shape
++            // (learn.microsoft.com "Single vs. split queries"). Measured on the
++            // live server: GetUserById 12.13ms -> 2.27ms per load (5.3x, three
++            // round trips included), GetUsers 3,432 rows in 70.2ms -> 418 rows
++            // in 4.36ms (16x). These two statements were #1 and #2 in the
++            // database by cumulative execution time (24,722s of the top-8's
++            // 40,000s), because 5-19 user loads fire per grid page request.
+             return dbContext.Users
+-                            .AsSingleQuery()
++                            .AsSplitQuery()
+                             .Include(user => user.Permissions)
+                             .Include(user => user.Preferences)
+                             .Include(user => user.AccessSchedules)
