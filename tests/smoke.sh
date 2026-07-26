@@ -101,6 +101,21 @@ info "browsing on both pods"
 curl -sf "${LEADER_URL}/Users/${user_id}/Items?Recursive=true" -H "X-Emby-Token: ${token}" > /dev/null || die "browse failed on leader"
 curl -sf "${REPLICA_URL}/Users/${user_id}/Items?Recursive=true" -H "X-Emby-Token: ${token}" > /dev/null || die "browse failed on replica"
 
+info "asserting the Limit=0 count-only path returns a well-formed empty page (patch 0008)"
+# This suite deliberately runs with NO media library, so an item-count assertion here
+# would be vacuous (0 == 0). What IS worth asserting without media is the shape of the
+# early return: patch 0008 skips the item query entirely when Limit=0 (the call
+# Folder.FillUserDataDtoValues makes per folder), so that path must still answer 200
+# with an Items array and a non-null TotalRecordCount rather than null or a 500.
+browse="Recursive=true&SortBy=SortName"
+zero="$(curl -sf "${LEADER_URL}/Users/${user_id}/Items?${browse}&Limit=0&StartIndex=0" \
+    -H "X-Emby-Token: ${token}")" || die "Limit=0 browse failed outright"
+[ "$(echo "${zero}" | jq -r '.Items | length')" = "0" ] || die "Limit=0 returned items"
+zero_count="$(echo "${zero}" | jq -r '.TotalRecordCount')"
+if [ -z "${zero_count}" ] || [ "${zero_count}" = "null" ]; then
+    die "Limit=0 returned no TotalRecordCount: the early return skipped the count too"
+fi
+
 info "asserting a user update DELETES old permissions instead of orphaning them (patch 0006)"
 # Regression guard. Permission.UserId / Preference.UserId are Guid? (optional), so
 # UpdateUserAsync's dbUser.Permissions.Clear() makes EF SEVER the relationship
@@ -132,6 +147,31 @@ pref_orphans="$(pgq 'SELECT count(*) FROM "Preferences" WHERE "UserId" IS NULL;'
 live_perms="$(pgq 'SELECT count(*) FROM "Permissions" WHERE "UserId" IS NOT NULL;')"
 [ "${live_perms}" -gt 0 ] \
     || die "user update deleted the live permission rows too (${live_perms} remain): access control is broken"
+
+info "asserting the count rewrite equals the grouped construction, NULL keys included (patch 0008)"
+# GetGroupedCount counts DISTINCT grouping keys; ApplyGroupingFilter instead materialises
+# one representative id per group and counts those. They are the same number by
+# construction, and this asserts it in SQL so a future rebase cannot let the two drift.
+#
+# The case that matters is a NULL PresentationUniqueKey: SELECT DISTINCT keeps NULL as a
+# group (matching GROUP BY), whereas count(DISTINCT col) would silently drop it and put
+# every folder's UnplayedItemCount off by one. A freshly wizarded server already carries
+# NULL-key rows (the PlaylistsFolder and the PLACEHOLDER sentinel), so this has teeth
+# here even though this suite mounts no media - and it covers the one thing a real
+# library cannot, since a populated library's hot path has no NULL keys at all.
+null_keys="$(pgq 'SELECT count(*) FROM "BaseItems" WHERE "PresentationUniqueKey" IS NULL;')"
+[ "${null_keys}" -ge 1 ] \
+    || die "no NULL PresentationUniqueKey rows exist, so the NULL-group assertion below would prove nothing"
+
+grouped="$(pgq 'SELECT count(*) FROM "BaseItems" b WHERE b."Id" IN (
+    SELECT (SELECT b1."Id" FROM "BaseItems" b1
+            WHERE (b0."PresentationUniqueKey" = b1."PresentationUniqueKey"
+                   OR (b0."PresentationUniqueKey" IS NULL AND b1."PresentationUniqueKey" IS NULL))
+            LIMIT 1)
+    FROM "BaseItems" b0 GROUP BY b0."PresentationUniqueKey");')"
+distinct="$(pgq 'SELECT count(*) FROM (SELECT DISTINCT "PresentationUniqueKey" FROM "BaseItems") t;')"
+[ "${grouped}" = "${distinct}" ] \
+    || die "grouped construction counts ${grouped} but the distinct-key count is ${distinct}: patch 0008 has diverged (NULL-key handling is the usual cause)"
 
 info "asserting the replica disarmed background work"
 # Exact phrase from patch 0004.
