@@ -11,7 +11,7 @@
       "customType": "regex",
       "description": "Pinned upstream jellyfin release the overlay reassembles from",
       "managerFilePatterns": ["/^UPSTREAM_REF$/"],
-      "matchStrings": ["(?<currentValue>v\\d+\\.\\d+\\.\\d+)"],
+      "matchStrings": ["(?<currentValue>v\\d+\\.\\d+(?:\\.\\d+)?)"],
       "depNameTemplate": "jellyfin/jellyfin",
       "datasourceTemplate": "github-tags"
     }
