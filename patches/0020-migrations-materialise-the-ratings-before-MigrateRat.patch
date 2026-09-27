@@ -1,16 +1,16 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 19:22:01 -0500
-Subject: [PATCH 12/13] migrations: materialise the ratings before
+Subject: [PATCH 12/15] migrations: materialise the ratings before
  MigrateRatingLevels writes
 
 Intent: MigrateRatingLevels streamed the DISTINCT OfficialRating reader
 and ran two ExecuteUpdate statements per rating on the same connection
 while that reader was still open. SQLite allows it; Npgsql has no
-multiple active result sets and throws NpgsqlOperationInProgressException
-("A command is already in progress"), which fails the migration, rolls
-the database back from the pre-migration dump and exits the migration
-Job non-zero. 12.1 re-dated the routine (20260910120000), so every
+multiple active result sets and throws
+NpgsqlOperationInProgressException ("A command is already in progress"),
+which fails the migration and rolls the database back from the
+pre-migration dump. 12.1 re-dated the routine (20260910120000), so every
 existing database runs it on the 12.1 upgrade. Materialise the distinct
 ratings with ToList() first; the rating set is small. Latent on an empty
 BaseItems table (no rows, no write while the reader is open), which is

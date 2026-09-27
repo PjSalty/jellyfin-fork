@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Sat, 25 Jul 2026 23:21:17 -0500
-Subject: [PATCH 05/13] users: split the user query so sibling collections stop
+Subject: [PATCH 05/15] users: split the user query so sibling collections stop
  multiplying
 
 Intent: UserQuery used AsSingleQuery over three SIBLING collections

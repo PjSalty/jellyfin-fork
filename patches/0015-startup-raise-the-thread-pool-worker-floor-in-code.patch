@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Tue, 1 Sep 2026 08:41:29 -0500
-Subject: [PATCH 07/13] startup: raise the thread-pool worker floor in code
+Subject: [PATCH 07/15] startup: raise the thread-pool worker floor in code
 
 Intent: the 2026-08-27 stall had the pool's worker floor at the core
 count while EF cache writes blocked synchronously on Redis: bursts

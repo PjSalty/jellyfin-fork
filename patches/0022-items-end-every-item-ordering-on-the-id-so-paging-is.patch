@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Sun, 27 Sep 2026 11:17:41 -0500
-Subject: [PATCH 14/14] items: end every item ordering on the id so paging is
+Subject: [PATCH 14/15] items: end every item ordering on the id so paging is
  stable
 
 Intent: ApplyOrder ends on SortName (or SortName, Name), which is not

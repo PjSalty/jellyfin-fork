@@ -3,7 +3,7 @@
 # Script: smoke.sh
 # Description: Two-replica smoke test. A migrate Job seeds the schema once,
 #              then a leader and a replica boot with migrations gated off.
-#              Asserts: both healthy, wizard on the leader, a token minted on
+#              Asserts: the migrate pass exited 0 without a startup error, both healthy, wizard on the leader, a token minted on
 #              the leader authenticates on the replica (read-through), browse
 #              works on both, the replica armed no scheduled tasks, and the
 #              rffmpeg shims dispatch to a worker then fall back locally.
@@ -63,6 +63,17 @@ docker run --rm -v "${TESTS_DIR}/.sshkeys:/keys" alpine:3.22 sh -c '
 
 info "starting stack (builds the patched server image, runs the migrate pass)"
 ${COMPOSE} up -d --build
+
+info "asserting the migrate pass exited 0 without a startup error"
+# Before patch 0023 a failed pass logged this line and still exited 0, so the
+# exit code alone proves nothing on an older image; check both.
+migrate_id="$(${COMPOSE} ps -a -q migrate)"
+[ -n "${migrate_id}" ] || die "migrate container not found"
+migrate_state="$(docker inspect -f '{{.State.Status}} {{.State.ExitCode}}' "${migrate_id}")"
+[ "${migrate_state}" = "exited 0" ] || die "migrate pass ended as '${migrate_state}', expected 'exited 0'"
+if ${COMPOSE} logs migrate 2>&1 | grep "Error while starting server" > /dev/null; then
+    die "migrate pass logged 'Error while starting server'"
+fi
 wait_healthy "${LEADER_URL}" || die "leader never became healthy"
 wait_healthy "${REPLICA_URL}" || die "replica never became healthy"
 

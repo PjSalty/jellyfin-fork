@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Sat, 5 Sep 2026 10:37:08 -0500
-Subject: [PATCH 11/13] mediainfo: drop unprobed lossless audio direct play
+Subject: [PATCH 11/15] mediainfo: drop unprobed lossless audio direct play
  claims
 
 Intent: the Android TV client (0.19.9/0.19.10, the version on all three
