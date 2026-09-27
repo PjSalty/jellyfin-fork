@@ -13,6 +13,7 @@ This is an overlay build, not a diverged fork: `UPSTREAM_REF` pins the upstream 
 | Auth tokens | tokens minted on one replica 401 on the others until restart | token cache misses read through to the database |
 | Concurrent saves | duplicate-key aborts on ItemValues, BaseItemProviders and UserData under parallel writers (HTTP 500 on playback progress) | conflict-safe upserts, so concurrent writers converge |
 | Upgrading an existing database | two 12.1 migrations use SQLite-only SQL or a second command on an open reader, and fail the migration Job on PostgreSQL | provider-neutral rewrites of both |
+| Paging a library | items that share a sort name come back in a different order on each page under PostgreSQL, so paged lists repeat some items and skip others | every item ordering ends on the item id, so pages are stable |
 
 Unset `JELLYFIN_ROLE` and everything behaves exactly like stock Jellyfin: the gates only close when you opt a pod into being a follower.
 
