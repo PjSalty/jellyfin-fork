@@ -69,6 +69,13 @@ info "asserting the skip-gate engaged on both serving pods"
 ${COMPOSE} logs jellyfin-leader | grep "migration machinery will not run" > /dev/null || die "leader skip-gate log line missing"
 ${COMPOSE} logs jellyfin-replica | grep "migration machinery will not run" > /dev/null || die "replica skip-gate log line missing"
 
+info "asserting the thread-pool worker floor engaged on both serving pods"
+# Exact phrase from patch 0015: the floor only exists if the startup log says so.
+# Same plain-grep-drains-the-stream rule as above; 2>&1 keeps any lines compose
+# emits on stderr in scope for the grep.
+${COMPOSE} logs jellyfin-leader 2>&1 | grep "Thread pool worker floor raised" > /dev/null || die "leader thread-pool floor log line missing"
+${COMPOSE} logs jellyfin-replica 2>&1 | grep "Thread pool worker floor raised" > /dev/null || die "replica thread-pool floor log line missing"
+
 info "completing the startup wizard on the leader"
 wizard() {
     step="$1"; shift

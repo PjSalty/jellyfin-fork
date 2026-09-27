@@ -1,0 +1,206 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 08:42:08 -0500
+Subject: [PATCH] userdata: upsert saves so duplicate reports cannot race the
+ key
+
+Intent: SaveUserData checked for an existing row and then Added or
+Attached, so duplicate progress/stop reports for the same
+(ItemId, UserId, CustomDataKey) could both miss the check, both INSERT,
+and abort the loser on PK_UserData (Postgres 23505 -> DbUpdateException
+-> HTTP 500 on POST /Sessions/Playing/Progress). Write through
+ON CONFLICT DO UPDATE instead so concurrent writers converge: DO UPDATE
+overwrites every non-key column, which is exactly what Attach+Modified
+did for an existing row, so single-writer behavior is unchanged. One
+INSERT round-trip per user-data key where SaveChanges batched; items
+carry one or two keys, so the ceiling is noted in a shortcut: marker,
+not engineered around. Same treatment as the ItemValues get-or-create
+in 0003. Includes the schema-backed table test.
+Drop when: upstream makes SaveUserData conflict-safe.
+---
+ .../Library/UserDataManager.cs                |  35 +++--
+ .../Library/UserDataUpsertTests.cs            | 124 ++++++++++++++++++
+ 2 files changed, 150 insertions(+), 9 deletions(-)
+ create mode 100644 tests/Jellyfin.Server.Implementations.Tests/Library/UserDataUpsertTests.cs
+
+diff --git a/Emby.Server.Implementations/Library/UserDataManager.cs b/Emby.Server.Implementations/Library/UserDataManager.cs
+index 45a5e1e..bf93921 100644
+--- a/Emby.Server.Implementations/Library/UserDataManager.cs
++++ b/Emby.Server.Implementations/Library/UserDataManager.cs
+@@ -64,17 +64,34 @@ namespace Emby.Server.Implementations.Library
+             {
+                 userData.Key = key;
+                 var userDataEntry = Map(userData, user.Id, item.Id);
+-                if (dbContext.UserData.Any(f => f.ItemId == userDataEntry.ItemId && f.UserId == userDataEntry.UserId && f.CustomDataKey == userDataEntry.CustomDataKey))
+-                {
+-                    dbContext.UserData.Attach(userDataEntry).State = EntityState.Modified;
+-                }
+-                else
+-                {
+-                    dbContext.UserData.Add(userDataEntry);
+-                }
++
++                // Duplicate progress/stop reports race the exists-check: two saves for
++                // the same (ItemId, UserId, CustomDataKey) can both miss it, both INSERT,
++                // and the loser aborts on the primary key (surfaces as HTTP 500 on
++                // POST /Sessions/Playing/Progress). Write through a conflict-tolerant
++                // upsert instead of the change tracker so concurrent writers converge;
++                // DO UPDATE overwrites every non-key column, which is what Attach +
++                // Modified did for an existing row. SQLite supports ON CONFLICT since 3.24.
++                // shortcut: one INSERT round-trip per user-data key (items carry one or
++                // two); batch into a single multi-row statement if that ever grows.
++                dbContext.Database.ExecuteSql(
++                    $"""
++                    INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "Rating", "PlaybackPositionTicks", "PlayCount", "IsFavorite", "LastPlayedDate", "Played", "AudioStreamIndex", "SubtitleStreamIndex", "Likes", "RetentionDate")
++                    VALUES ({userDataEntry.ItemId}, {userDataEntry.UserId}, {userDataEntry.CustomDataKey}, {userDataEntry.Rating}, {userDataEntry.PlaybackPositionTicks}, {userDataEntry.PlayCount}, {userDataEntry.IsFavorite}, {userDataEntry.LastPlayedDate}, {userDataEntry.Played}, {userDataEntry.AudioStreamIndex}, {userDataEntry.SubtitleStreamIndex}, {userDataEntry.Likes}, {userDataEntry.RetentionDate})
++                    ON CONFLICT ("ItemId", "UserId", "CustomDataKey") DO UPDATE SET
++                        "Rating" = excluded."Rating",
++                        "PlaybackPositionTicks" = excluded."PlaybackPositionTicks",
++                        "PlayCount" = excluded."PlayCount",
++                        "IsFavorite" = excluded."IsFavorite",
++                        "LastPlayedDate" = excluded."LastPlayedDate",
++                        "Played" = excluded."Played",
++                        "AudioStreamIndex" = excluded."AudioStreamIndex",
++                        "SubtitleStreamIndex" = excluded."SubtitleStreamIndex",
++                        "Likes" = excluded."Likes",
++                        "RetentionDate" = excluded."RetentionDate"
++                    """);
+             }
+ 
+-            dbContext.SaveChanges();
+             transaction.Commit();
+ 
+             var userId = user.InternalId;
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataUpsertTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataUpsertTests.cs
+new file mode 100644
+index 0000000..bc69253
+--- /dev/null
++++ b/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataUpsertTests.cs
+@@ -0,0 +1,124 @@
++using System;
++using System.Data.Common;
++using System.Linq;
++using Jellyfin.Database.Implementations;
++using Jellyfin.Database.Implementations.Entities;
++using Jellyfin.Database.Implementations.Locking;
++using Jellyfin.Database.Providers.Sqlite;
++using Microsoft.Data.Sqlite;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.Logging.Abstractions;
++using Xunit;
++
++namespace Jellyfin.Server.Implementations.Tests.Library;
++
++/// <summary>
++/// Covers the conflict-tolerant UserData upsert used by
++/// <c>UserDataManager.SaveUserData</c>. The duplicate-report race itself cannot be
++/// reproduced on the in-memory SQLite test harness (SQLite serialises writes, which is
++/// exactly why the bug does not occur there), but these tests verify the facts the fix
++/// relies on against the real generated schema: the composite primary key is enforced,
++/// and the ON CONFLICT DO UPDATE the fix emits is portable to SQLite, keeps a single
++/// row, and overwrites it with the newest values.
++/// </summary>
++public sealed class UserDataUpsertTests : IDisposable
++{
++    private const string TestDataKey = "test-key";
++
++    private readonly SqliteConnection _connection;
++    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
++    private readonly Guid _itemId;
++    private readonly Guid _userId;
++
++    public UserDataUpsertTests()
++    {
++        _connection = new SqliteConnection("Data Source=:memory:");
++        _connection.Open();
++
++        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
++            .UseSqlite(_connection)
++            .Options;
++
++        using var context = CreateDbContext();
++        context.Database.EnsureCreated();
++
++        // UserData rows carry foreign keys to BaseItems and Users, so seed one of each.
++        var user = new User("upsert-test", "auth-provider", "reset-provider");
++        _userId = user.Id;
++        _itemId = Guid.NewGuid();
++        context.Users.Add(user);
++        context.BaseItems.Add(new BaseItemEntity
++        {
++            Id = _itemId,
++            Type = "MediaBrowser.Controller.Entities.Movies.Movie"
++        });
++        context.SaveChanges();
++    }
++
++    public void Dispose()
++    {
++        _connection.Dispose();
++    }
++
++    [Fact]
++    public void PlainInsert_DuplicateKey_ViolatesPrimaryKey()
++    {
++        using var context = CreateDbContext();
++
++        InsertPlain(context, 100);
++
++        // Without conflict handling, a duplicate report saving the same
++        // (ItemId, UserId, CustomDataKey) violates the composite primary key. This is
++        // the failure surfaced as HTTP 500 on POST /Sessions/Playing/Progress.
++        Assert.ThrowsAny<DbException>(() => InsertPlain(context, 200));
++    }
++
++    [Fact]
++    public void Upsert_DuplicateKey_KeepsOneRowWithNewestValues()
++    {
++        using var context = CreateDbContext();
++
++        Upsert(context, 100);
++        Upsert(context, 200);
++
++        // Guid's == operator is on the banned-API list for this project; Equals is the sanctioned spelling.
++        var rows = context.UserData
++            .Where(e => e.ItemId.Equals(_itemId) && e.UserId.Equals(_userId))
++            .ToList();
++        var row = Assert.Single(rows);
++        Assert.Equal(200L, row.PlaybackPositionTicks);
++    }
++
++    private void InsertPlain(JellyfinDbContext context, long positionTicks)
++        => context.Database.ExecuteSql(
++            $"""
++            INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "Rating", "PlaybackPositionTicks", "PlayCount", "IsFavorite", "LastPlayedDate", "Played", "AudioStreamIndex", "SubtitleStreamIndex", "Likes", "RetentionDate")
++            VALUES ({_itemId}, {_userId}, {TestDataKey}, {(double?)null}, {positionTicks}, {1}, {false}, {(DateTime?)null}, {false}, {(int?)null}, {(int?)null}, {(bool?)null}, {(DateTime?)null})
++            """);
++
++    // Mirrors the upsert in UserDataManager.SaveUserData.
++    private void Upsert(JellyfinDbContext context, long positionTicks)
++        => context.Database.ExecuteSql(
++            $"""
++            INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "Rating", "PlaybackPositionTicks", "PlayCount", "IsFavorite", "LastPlayedDate", "Played", "AudioStreamIndex", "SubtitleStreamIndex", "Likes", "RetentionDate")
++            VALUES ({_itemId}, {_userId}, {TestDataKey}, {(double?)null}, {positionTicks}, {1}, {false}, {(DateTime?)null}, {false}, {(int?)null}, {(int?)null}, {(bool?)null}, {(DateTime?)null})
++            ON CONFLICT ("ItemId", "UserId", "CustomDataKey") DO UPDATE SET
++                "Rating" = excluded."Rating",
++                "PlaybackPositionTicks" = excluded."PlaybackPositionTicks",
++                "PlayCount" = excluded."PlayCount",
++                "IsFavorite" = excluded."IsFavorite",
++                "LastPlayedDate" = excluded."LastPlayedDate",
++                "Played" = excluded."Played",
++                "AudioStreamIndex" = excluded."AudioStreamIndex",
++                "SubtitleStreamIndex" = excluded."SubtitleStreamIndex",
++                "Likes" = excluded."Likes",
++                "RetentionDate" = excluded."RetentionDate"
++            """);
++
++    private JellyfinDbContext CreateDbContext()
++        => new JellyfinDbContext(
++            _dbOptions,
++            NullLogger<JellyfinDbContext>.Instance,
++            new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
++            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
++}
+-- 
+2.55.0
+
