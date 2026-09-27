@@ -1,6 +1,6 @@
 # jellyfin-fork
 
-Jellyfin server overlay for multi-replica operation on Kubernetes: a pinned upstream ref plus five small patches. Migration gating, leader-gated background work, and cross-replica token validity. Pairs with [jellyfin-pgsql](https://github.com/PjSalty/jellyfin-pgsql) (PostgreSQL provider + Valkey second level cache), which carries the database side with zero server patches.
+Jellyfin server overlay for multi-replica operation on Kubernetes: a pinned upstream release (currently v12.1) plus a short series of patches. Migration gating, leader-gated background work, cross-replica token validity, conflict-safe concurrent writes, and PostgreSQL-safe versions of the upstream migrations that only ran on SQLite. Pairs with [jellyfin-pgsql](https://github.com/PjSalty/jellyfin-pgsql) (PostgreSQL provider + Valkey second level cache), which carries the database side with zero server patches.
 
 This is an overlay build, not a diverged fork: `UPSTREAM_REF` pins the upstream release, `patches/` holds the changes with intent and drop-when conditions in their messages, and CI reassembles from pristine upstream on every run. `DIVERGENCE.md` is the complete list.
 
@@ -11,7 +11,8 @@ This is an overlay build, not a diverged fork: `UPSTREAM_REF` pins the upstream 
 | DB migrations | every replica races the migration path at boot | a Job runs `--mode MigrateSystem` once; replicas set `JELLYFIN_SKIP_MIGRATIONS=true` and fail fast if the schema is behind |
 | Scheduled tasks, library scans, DVR | every replica arms every cron trigger and records everything N times | arm only where `JELLYFIN_ROLE=leader`; manual API-invoked runs still work anywhere |
 | Auth tokens | tokens minted on one replica 401 on the others until restart | token cache misses read through to the database |
-| Concurrent item saves | duplicate-key aborts on ItemValues under parallel writers | upstream PR 17119's get-or-create fix, ported to this tag |
+| Concurrent saves | duplicate-key aborts on ItemValues, BaseItemProviders and UserData under parallel writers (HTTP 500 on playback progress) | conflict-safe upserts, so concurrent writers converge |
+| Upgrading an existing database | two 12.1 migrations use SQLite-only SQL or a second command on an open reader, and fail the migration Job on PostgreSQL | provider-neutral rewrites of both |
 
 Unset `JELLYFIN_ROLE` and everything behaves exactly like stock Jellyfin: the gates only close when you opt a pod into being a follower.
 
@@ -29,6 +30,8 @@ docker build -f docker/Dockerfile -t jellyfin-fork:local .
 ```
 
 The image compiles the patched server and overlays the binaries onto the official image, keeping its web client and ffmpeg.
+
+`./tests/smoke.sh` runs the migrate Job, a leader and a replica against PostgreSQL 18 with the [jellyfin-pgsql](https://github.com/PjSalty/jellyfin-pgsql) release named by `JELLYFIN_PGSQL_VERSION`; set `JELLYFIN_PGSQL_LOCAL_DIR` to a directory holding a release zip and its `SHA256SUMS` to smoke a plugin build before it is published.
 
 ## Credits and license
 
