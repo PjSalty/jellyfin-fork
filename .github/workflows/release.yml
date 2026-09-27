@@ -18,13 +18,13 @@ jobs:
 
       - uses: actions/setup-dotnet@v4
         with:
-          dotnet-version: 9.0.x
+          dotnet-version: 10.0.x
 
       - name: Assemble from upstream
         run: ./build/assemble.sh
 
       - name: Build the patched server
-        run: dotnet build upstream/Jellyfin.Server/Jellyfin.Server.csproj -c Release -p:NoWarn=CA1707
+        run: dotnet build upstream/Jellyfin.Server/Jellyfin.Server.csproj -c Release
 
       - name: Smoke test
         run: ./tests/smoke.sh
