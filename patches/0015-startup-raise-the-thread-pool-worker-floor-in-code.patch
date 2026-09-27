@@ -1,0 +1,80 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 08:41:29 -0500
+Subject: [PATCH] startup: raise the thread-pool worker floor in code
+
+The 2026-08-27 stall had the pool's worker floor at the core count while
+EF cache writes blocked synchronously on Redis: bursts queued API work
+behind the pool's one-to-two threads per second ramp, p95 hit five
+seconds and webOS clients timed out. The env knob was already deployed
+and did nothing - DOTNET_ThreadPool_MinThreads=32 was ignored without a
+word, and the DOTNET_/COMPlus_ config family also parses numbers as hex,
+so that route is two silent failure modes in one. Raise the floor to
+max(32, current) in code instead, completion-port floor untouched, and
+log the before and after values at Information: "worker floor raised"
+greppable from the pod log is the contract that the floor is real. 32 is
+the 2026-08-29 load measurement.
+---
+ Jellyfin.Server/Helpers/StartupHelpers.cs | 28 +++++++++++++++++++++++
+ Jellyfin.Server/Program.cs                |  1 +
+ 2 files changed, 29 insertions(+)
+
+diff --git a/Jellyfin.Server/Helpers/StartupHelpers.cs b/Jellyfin.Server/Helpers/StartupHelpers.cs
+index 93c9961..c331986 100644
+--- a/Jellyfin.Server/Helpers/StartupHelpers.cs
++++ b/Jellyfin.Server/Helpers/StartupHelpers.cs
+@@ -6,6 +6,7 @@ using System.Linq;
+ using System.Runtime.InteropServices;
+ using System.Runtime.Versioning;
+ using System.Text;
++using System.Threading;
+ using System.Threading.Tasks;
+ using Emby.Server.Implementations;
+ using Jellyfin.Server.ServerSetupApp;
+@@ -297,4 +298,31 @@ public static class StartupHelpers
+         // Ref: https://docs.microsoft.com/en-us/dotnet/api/system.text.codepagesencodingprovider.instance?view=netcore-3.0#remarks
+         Encoding.RegisterProvider(CodePagesEncodingProvider.Instance);
+     }
++
++    /// <summary>
++    /// Raises the worker-thread floor of the managed thread pool.
++    /// </summary>
++    /// <param name="logger">The logger to use.</param>
++    public static void RaiseThreadPoolFloor(ILogger logger)
++    {
++        // DOTNET_ThreadPool_MinThreads was in place and silently ignored: the
++        // runtime gives no feedback when it drops a config knob, and the
++        // DOTNET_/COMPlus_ family parses numbers as hex on top of that. With the
++        // floor stuck at the core count, a burst of synchronous cache writes
++        // queued API work behind the pool's one-to-two threads per second ramp
++        // until clients timed out. Set the floor in code and log it; the log
++        // line below is the proof the floor is real. 32 is the 2026-08-29 load
++        // measurement, and the current values win when they are already higher.
++        const int MinimumWorkerThreads = 32;
++        ThreadPool.GetMinThreads(out var workerThreads, out var completionPortThreads);
++        var targetWorkerThreads = Math.Max(MinimumWorkerThreads, workerThreads);
++        if (ThreadPool.SetMinThreads(targetWorkerThreads, completionPortThreads))
++        {
++            logger.LogInformation("Thread pool worker floor raised: {PreviousWorkerThreads} -> {TargetWorkerThreads}", workerThreads, targetWorkerThreads);
++        }
++        else
++        {
++            logger.LogWarning("Thread pool worker floor raise rejected by the runtime: {PreviousWorkerThreads} -> {TargetWorkerThreads}", workerThreads, targetWorkerThreads);
++        }
++    }
+ }
+diff --git a/Jellyfin.Server/Program.cs b/Jellyfin.Server/Program.cs
+index 248f61d..e6930ff 100644
+--- a/Jellyfin.Server/Program.cs
++++ b/Jellyfin.Server/Program.cs
+@@ -114,6 +114,7 @@ namespace Jellyfin.Server
+                 Assembly.GetEntryAssembly()!.GetName().Version!.ToString(3));
+ 
+             StartupHelpers.LogEnvironmentInfo(_logger, appPaths);
++            StartupHelpers.RaiseThreadPoolFloor(_logger);
+ 
+             // If hosting the web client, validate the client content path
+             if (startupConfig.HostWebClient())
+-- 
+2.55.0
+

@@ -1,0 +1,190 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Tue, 1 Sep 2026 08:42:40 -0500
+Subject: [PATCH] items: upsert provider rows so parallel saves cannot race the
+ key
+
+Intent: for an existing item, UpdateOrInsertItems deletes the
+BaseItemProviders rows and re-inserts them through the re-attached
+change tracker (the provider entities carry no ItemId of their own, so
+Attach marks them Added). Two parallel refresh tasks saving the same
+item both run the DELETE, neither DELETE sees the other's uncommitted
+re-inserts under READ COMMITTED, and the losing transaction aborts on
+PK_BaseItemProviders (observed four times in one library-scan window).
+Detach the providers from the tracked graph and write them with
+ON CONFLICT DO UPDATE so concurrent savers converge on the last
+committed value; iterating in ordinal ProviderId order makes every
+transaction take its row locks in the same sequence, closing the 40P01
+deadlock window a per-transaction ordering would leave. Same treatment
+as the ItemValues get-or-create in 0003; new-item inserts are untouched
+(a race there hits PK_BaseItems first, a different failure). The
+sibling delete-then-reinsert paths (BaseItemImageInfos,
+BaseItemMetadataFields) stay on the change tracker: their rows carry
+fresh per-row Guids, so the same race duplicates rows rather than
+aborting, a residual documented in DIVERGENCE.md. Includes the
+schema-backed table test.
+Drop when: upstream serialises or upserts provider writes (same
+ItemPersistenceService refactor line as 0003).
+---
+ .../Item/BaseItemRepository.cs                |  27 +++++
+ .../Item/BaseItemProviderUpsertTests.cs       | 110 ++++++++++++++++++
+ 2 files changed, 137 insertions(+)
+ create mode 100644 tests/Jellyfin.Server.Implementations.Tests/Item/BaseItemProviderUpsertTests.cs
+
+diff --git a/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs b/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
+index bf1fa9c..15d9eff 100644
+--- a/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
++++ b/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
+@@ -730,6 +730,33 @@ public sealed class BaseItemRepository
+                     context.BaseItemMetadataFields.AddRange(entity.LockedFields);
+                 }
+ 
++                // Parallel refresh tasks can save the same item concurrently: each one
++                // runs the provider ExecuteDelete above, neither DELETE sees the other's
++                // uncommitted re-inserts, and the losing transaction then aborts on the
++                // (ItemId, ProviderId) primary key (observed four times in one library
++                // scan window on PostgreSQL). Detach the providers from the tracked graph
++                // and write them with a conflict-tolerant upsert instead so concurrent
++                // savers converge on the last committed value. Ordinal ProviderId order
++                // makes every transaction take the row locks in the same sequence, so two
++                // concurrent savers cannot deadlock each other (40P01). Same approach as
++                // the ItemValues get-or-create; SQLite has supported ON CONFLICT since 3.24.
++                // shortcut: one statement per provider row (a handful per item); batch
++                // into a single multi-row INSERT if that ever grows.
++                var providers = entity.Provider;
++                entity.Provider = null;
++                if (providers is not null)
++                {
++                    foreach (var provider in providers.OrderBy(p => p.ProviderId, StringComparer.Ordinal))
++                    {
++                        context.Database.ExecuteSql(
++                            $"""
++                            INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
++                            VALUES ({entity.Id}, {provider.ProviderId}, {provider.ProviderValue})
++                            ON CONFLICT ("ItemId", "ProviderId") DO UPDATE SET "ProviderValue" = excluded."ProviderValue"
++                            """);
++                    }
++                }
++
+                 context.BaseItems.Attach(entity).State = EntityState.Modified;
+             }
+         }
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Item/BaseItemProviderUpsertTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Item/BaseItemProviderUpsertTests.cs
+new file mode 100644
+index 0000000..a1bde8a
+--- /dev/null
++++ b/tests/Jellyfin.Server.Implementations.Tests/Item/BaseItemProviderUpsertTests.cs
+@@ -0,0 +1,110 @@
++using System;
++using System.Data.Common;
++using System.Linq;
++using Jellyfin.Database.Implementations;
++using Jellyfin.Database.Implementations.Entities;
++using Jellyfin.Database.Implementations.Locking;
++using Jellyfin.Database.Providers.Sqlite;
++using Microsoft.Data.Sqlite;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.Extensions.Logging.Abstractions;
++using Xunit;
++
++namespace Jellyfin.Server.Implementations.Tests.Item;
++
++/// <summary>
++/// Covers the conflict-tolerant BaseItemProviders upsert used by
++/// <c>BaseItemRepository.UpdateOrInsertItems</c>. The parallel-save race itself cannot be
++/// reproduced on the in-memory SQLite test harness (SQLite serialises writes, which is
++/// exactly why the bug does not occur there), but these tests verify the facts the fix
++/// relies on against the real generated schema: the composite primary key is enforced,
++/// and the ON CONFLICT DO UPDATE the fix emits is portable to SQLite, keeps a single
++/// row, and overwrites it with the newest value.
++/// </summary>
++public sealed class BaseItemProviderUpsertTests : IDisposable
++{
++    private const string ProviderId = "Imdb";
++
++    private readonly SqliteConnection _connection;
++    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
++    private readonly Guid _itemId;
++
++    public BaseItemProviderUpsertTests()
++    {
++        _connection = new SqliteConnection("Data Source=:memory:");
++        _connection.Open();
++
++        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
++            .UseSqlite(_connection)
++            .Options;
++
++        using var context = CreateDbContext();
++        context.Database.EnsureCreated();
++
++        // Provider rows carry a foreign key to BaseItems, so seed the parent item.
++        _itemId = Guid.NewGuid();
++        context.BaseItems.Add(new BaseItemEntity
++        {
++            Id = _itemId,
++            Type = "MediaBrowser.Controller.Entities.Movies.Movie"
++        });
++        context.SaveChanges();
++    }
++
++    public void Dispose()
++    {
++        _connection.Dispose();
++    }
++
++    [Fact]
++    public void PlainInsert_DuplicateKey_ViolatesPrimaryKey()
++    {
++        using var context = CreateDbContext();
++
++        InsertPlain(context, "tt0000001");
++
++        // Without conflict handling, two saves of the same item racing the
++        // delete-then-reinsert of its provider rows violate the (ItemId, ProviderId)
++        // primary key; the losing library-scan transaction aborts.
++        Assert.ThrowsAny<DbException>(() => InsertPlain(context, "tt0000002"));
++    }
++
++    [Fact]
++    public void Upsert_DuplicateKey_KeepsOneRowWithNewestValue()
++    {
++        using var context = CreateDbContext();
++
++        Upsert(context, "tt0000001");
++        Upsert(context, "tt0000002");
++
++        // Guid's == operator is on the banned-API list for this project; Equals is the sanctioned spelling.
++        var rows = context.BaseItemProviders
++            .Where(e => e.ItemId.Equals(_itemId))
++            .ToList();
++        var row = Assert.Single(rows);
++        Assert.Equal("tt0000002", row.ProviderValue);
++    }
++
++    private void InsertPlain(JellyfinDbContext context, string value)
++        => context.Database.ExecuteSql(
++            $"""
++            INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
++            VALUES ({_itemId}, {ProviderId}, {value})
++            """);
++
++    // Mirrors the upsert in BaseItemRepository.UpdateOrInsertItems.
++    private void Upsert(JellyfinDbContext context, string value)
++        => context.Database.ExecuteSql(
++            $"""
++            INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
++            VALUES ({_itemId}, {ProviderId}, {value})
++            ON CONFLICT ("ItemId", "ProviderId") DO UPDATE SET "ProviderValue" = excluded."ProviderValue"
++            """);
++
++    private JellyfinDbContext CreateDbContext()
++        => new JellyfinDbContext(
++            _dbOptions,
++            NullLogger<JellyfinDbContext>.Instance,
++            new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
++            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
++}
+-- 
+2.55.0
+
