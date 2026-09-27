@@ -1,13 +1,23 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Sat, 11 Jul 2026 08:18:32 -0500
-Subject: [PATCH 4/5] replication: leader-gate background work
+Subject: [PATCH 03/13] replication: leader-gate background work
 
 Intent: JELLYFIN_ROLE unset or 'leader' behaves exactly like stock; any
 other value disarms scheduled-task triggers, trigger-originated scans,
 and LiveTV/DVR timer arming, with one startup log line stating the role
-and what is disarmed. Manual API-invoked runs work on any pod.
+and what is disarmed. Manual API-invoked runs work on any pod. Carried
+unchanged onto 12.x: ScheduledTaskWorker, TaskManager, RecordingsHost
+and TimerManager are identical to 10.11.11, and 12.x adds no hosted
+service and no background timer (its one new timer, SyncPlay's group
+wait timer, is request-driven).
+Ceiling: only arming is gated. A run that is asked for (task execution
+through the API, QueueLibraryScan after a library edit or wizard
+completion) executes on whichever pod receives the request, and that
+pod then starts its realtime library monitor.
 Drop when: upstream ships first-class multi-instance roles.
+
+Patch: 0004
 ---
  .../ScheduledTasks/ScheduledTaskWorker.cs     | 15 ++++++++++
  .../ScheduledTasks/TaskManager.cs             | 10 +++++++

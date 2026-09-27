@@ -1,22 +1,33 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
-From: Salty <hoffman.viking@gmail.com>
-Date: Sun, 30 Aug 2026 14:12:35 -0500
-Subject: [PATCH] hls: hand out the playlist after the first segment
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 19:14:12 -0500
+Subject: [PATCH 06/13] hls: hand out the live playlist after the first segment
 
-The controller waited for the client-requested minimum (two or three
-segments) before returning the playlist, so playback start paid one or
-two extra segment durations while ffmpeg was already producing. Serve a
-growing playlist after the first segment instead: hls.js and ExoPlayer
-poll the playlist and apply their own buffering either way.
+Intent: GetLiveHlsStream (Videos/{itemId}/live.m3u8, the segmented live
+path) waited for the requested MinSegments (2 or 3 when the client
+sends none) before returning the playlist of a transcode it had just
+started, so playback start paid one or two extra segment durations
+while ffmpeg was already producing. Return it once ONE segment exists
+instead: a growing playlist is ordinary HLS, and hls.js (web, webOS)
+and ExoPlayer (Fire TV) poll it and apply their own buffering either
+way. Only the first response of a newly started transcode changes;
+the VOD master/main playlists are untouched. Carried unchanged onto
+12.x (same anchor, three lines earlier).
+Ceiling: a no-op for a client whose profile already asks for one
+segment.
+Drop when: upstream adds its own fast-start, or a client stalls on a
+one-entry playlist.
+
+Patch: 0012
 ---
  Jellyfin.Api/Controllers/DynamicHlsController.cs | 11 +++++++++++
  1 file changed, 11 insertions(+)
 
 diff --git a/Jellyfin.Api/Controllers/DynamicHlsController.cs b/Jellyfin.Api/Controllers/DynamicHlsController.cs
-index c69040d4..cfc80b2f 100644
+index 034a9de..44edddf 100644
 --- a/Jellyfin.Api/Controllers/DynamicHlsController.cs
 +++ b/Jellyfin.Api/Controllers/DynamicHlsController.cs
-@@ -326,6 +326,17 @@ public class DynamicHlsController : BaseJellyfinApiController
+@@ -323,6 +323,17 @@ public class DynamicHlsController : BaseJellyfinApiController
                      }
  
                      minSegments = state.MinSegments;

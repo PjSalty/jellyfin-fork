@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Tue, 1 Sep 2026 08:42:08 -0500
-Subject: [PATCH] userdata: upsert saves so duplicate reports cannot race the
- key
+Subject: [PATCH 08/13] userdata: upsert saves so duplicate reports cannot race
+ the key
 
 Intent: SaveUserData checked for an existing row and then Added or
 Attached, so duplicate progress/stop reports for the same
@@ -11,23 +11,43 @@ and abort the loser on PK_UserData (Postgres 23505 -> DbUpdateException
 -> HTTP 500 on POST /Sessions/Playing/Progress). Write through
 ON CONFLICT DO UPDATE instead so concurrent writers converge: DO UPDATE
 overwrites every non-key column, which is exactly what Attach+Modified
-did for an existing row, so single-writer behavior is unchanged. One
-INSERT round-trip per user-data key where SaveChanges batched; items
-carry one or two keys, so the ceiling is noted in a shortcut: marker,
-not engineered around. Same treatment as the ItemValues get-or-create
-in 0003. Includes the schema-backed table test.
+did for an existing row, so single-writer behavior is unchanged. Same
+treatment as the ItemValues get-or-create in 0003. SaveUserData is
+byte-identical between 10.11.11 and 12.1 and the UserData entity did
+not change, so the statement carries over as is.
+Fix carried in this revision: the raw INSERT bypassed the model's
+DateTime converter (both providers write v.ToUniversalTime()), so a
+LastPlayedDate that arrives without a UTC designator (POST
+/UserItems/{id}/UserData, the legacy datePlayed binder) threw on
+PostgreSQL ("only UTC is supported" for timestamptz, HTTP 500) and was
+stored as local wall-clock time on SQLite. LastPlayedDate and
+RetentionDate are now bound through ToUniversalTime(), the converter's
+own write rule. Includes the schema-backed table tests and a
+SaveUserData test that stores a Local date and reads back UTC (fails
+without the fix whenever the process time zone is not UTC).
+Ceiling: one INSERT round-trip per user-data key where SaveChanges
+batched (shortcut: marker in the code). The column list is explicit:
+a new upstream UserData column must be added to the statement, or it is
+left at its default on insert and never updated on conflict. Errors
+surface per statement as the provider's exception (DbException, or an
+ArgumentException from the parameter writer) instead of a
+DbUpdateException at SaveChanges. Upstream PR 18001 (open, 12.2) edits
+the line this patch removes; resolve by keeping its ExecuteDelete after
+the upsert loop.
 Drop when: upstream makes SaveUserData conflict-safe.
+
+Patch: 0016
 ---
- .../Library/UserDataManager.cs                |  35 +++--
- .../Library/UserDataUpsertTests.cs            | 124 ++++++++++++++++++
- 2 files changed, 150 insertions(+), 9 deletions(-)
+ .../Library/UserDataManager.cs                |  38 +++-
+ .../Library/UserDataUpsertTests.cs            | 174 ++++++++++++++++++
+ 2 files changed, 203 insertions(+), 9 deletions(-)
  create mode 100644 tests/Jellyfin.Server.Implementations.Tests/Library/UserDataUpsertTests.cs
 
 diff --git a/Emby.Server.Implementations/Library/UserDataManager.cs b/Emby.Server.Implementations/Library/UserDataManager.cs
-index 45a5e1e..bf93921 100644
+index 0680046..010489a 100644
 --- a/Emby.Server.Implementations/Library/UserDataManager.cs
 +++ b/Emby.Server.Implementations/Library/UserDataManager.cs
-@@ -64,17 +64,34 @@ namespace Emby.Server.Implementations.Library
+@@ -64,17 +64,37 @@ namespace Emby.Server.Implementations.Library
              {
                  userData.Key = key;
                  var userDataEntry = Map(userData, user.Id, item.Id);
@@ -49,10 +69,13 @@ index 45a5e1e..bf93921 100644
 +                // Modified did for an existing row. SQLite supports ON CONFLICT since 3.24.
 +                // shortcut: one INSERT round-trip per user-data key (items carry one or
 +                // two); batch into a single multi-row statement if that ever grows.
++                // Raw SQL skips the model's DateTime converter, so the dates get its
++                // ToUniversalTime here: PostgreSQL rejects a non-UTC timestamptz parameter
++                // and SQLite would store the local wall clock.
 +                dbContext.Database.ExecuteSql(
 +                    $"""
 +                    INSERT INTO "UserData" ("ItemId", "UserId", "CustomDataKey", "Rating", "PlaybackPositionTicks", "PlayCount", "IsFavorite", "LastPlayedDate", "Played", "AudioStreamIndex", "SubtitleStreamIndex", "Likes", "RetentionDate")
-+                    VALUES ({userDataEntry.ItemId}, {userDataEntry.UserId}, {userDataEntry.CustomDataKey}, {userDataEntry.Rating}, {userDataEntry.PlaybackPositionTicks}, {userDataEntry.PlayCount}, {userDataEntry.IsFavorite}, {userDataEntry.LastPlayedDate}, {userDataEntry.Played}, {userDataEntry.AudioStreamIndex}, {userDataEntry.SubtitleStreamIndex}, {userDataEntry.Likes}, {userDataEntry.RetentionDate})
++                    VALUES ({userDataEntry.ItemId}, {userDataEntry.UserId}, {userDataEntry.CustomDataKey}, {userDataEntry.Rating}, {userDataEntry.PlaybackPositionTicks}, {userDataEntry.PlayCount}, {userDataEntry.IsFavorite}, {userDataEntry.LastPlayedDate?.ToUniversalTime()}, {userDataEntry.Played}, {userDataEntry.AudioStreamIndex}, {userDataEntry.SubtitleStreamIndex}, {userDataEntry.Likes}, {userDataEntry.RetentionDate?.ToUniversalTime()})
 +                    ON CONFLICT ("ItemId", "UserId", "CustomDataKey") DO UPDATE SET
 +                        "Rating" = excluded."Rating",
 +                        "PlaybackPositionTicks" = excluded."PlaybackPositionTicks",
@@ -73,21 +96,29 @@ index 45a5e1e..bf93921 100644
              var userId = user.InternalId;
 diff --git a/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataUpsertTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataUpsertTests.cs
 new file mode 100644
-index 0000000..bc69253
+index 0000000..cbf014c
 --- /dev/null
 +++ b/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataUpsertTests.cs
-@@ -0,0 +1,124 @@
+@@ -0,0 +1,174 @@
 +using System;
 +using System.Data.Common;
 +using System.Linq;
++using System.Threading;
++using Emby.Server.Implementations.Library;
 +using Jellyfin.Database.Implementations;
 +using Jellyfin.Database.Implementations.Entities;
 +using Jellyfin.Database.Implementations.Locking;
 +using Jellyfin.Database.Providers.Sqlite;
++using MediaBrowser.Controller.Configuration;
++using MediaBrowser.Controller.Entities;
++using MediaBrowser.Model.Configuration;
++using MediaBrowser.Model.Entities;
 +using Microsoft.Data.Sqlite;
 +using Microsoft.EntityFrameworkCore;
 +using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
 +using Xunit;
++using AudioBook = MediaBrowser.Controller.Entities.AudioBook;
 +
 +namespace Jellyfin.Server.Implementations.Tests.Library;
 +
@@ -108,6 +139,7 @@ index 0000000..bc69253
 +    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
 +    private readonly Guid _itemId;
 +    private readonly Guid _userId;
++    private readonly User _user;
 +
 +    public UserDataUpsertTests()
 +    {
@@ -122,7 +154,8 @@ index 0000000..bc69253
 +        context.Database.EnsureCreated();
 +
 +        // UserData rows carry foreign keys to BaseItems and Users, so seed one of each.
-+        var user = new User("upsert-test", "auth-provider", "reset-provider");
++        _user = new User("upsert-test", "auth-provider", "reset-provider");
++        var user = _user;
 +        _userId = user.Id;
 +        _itemId = Guid.NewGuid();
 +        context.Users.Add(user);
@@ -166,6 +199,46 @@ index 0000000..bc69253
 +            .ToList();
 +        var row = Assert.Single(rows);
 +        Assert.Equal(200L, row.PlaybackPositionTicks);
++    }
++
++    [Fact]
++    public void SaveUserData_LocalLastPlayedDate_IsStoredAsUtc()
++    {
++        // A client date without a Z suffix binds as Local or Unspecified. The change tracker normalised it
++        // through the provider's UTC converter; the raw upsert has to do the same. Only discriminates when
++        // the process time zone is not UTC.
++        var playedUtc = new DateTime(2026, 9, 26, 15, 0, 0, DateTimeKind.Utc);
++        var item = new AudioBook
++        {
++            Id = _itemId,
++            Name = "Book Title",
++            Album = "Series",
++            AlbumArtists = ["Author"],
++            IndexNumber = 1
++        };
++
++        CreateUserDataManager().SaveUserData(
++            _user,
++            item,
++            new UserItemData { Key = item.GetUserDataKeys()[0], Played = true, LastPlayedDate = playedUtc.ToLocalTime() },
++            UserDataSaveReason.TogglePlayed,
++            CancellationToken.None);
++
++        using var context = CreateDbContext();
++        var rows = context.UserData.Where(e => e.ItemId.Equals(_itemId)).ToList();
++        Assert.NotEmpty(rows);
++        Assert.All(rows, row => Assert.Equal(playedUtc, row.LastPlayedDate));
++    }
++
++    private UserDataManager CreateUserDataManager()
++    {
++        var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
++        factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
++
++        var config = new Mock<IServerConfigurationManager>();
++        config.SetupGet(c => c.Configuration).Returns(new ServerConfiguration());
++
++        return new UserDataManager(config.Object, factory.Object);
 +    }
 +
 +    private void InsertPlain(JellyfinDbContext context, long positionTicks)

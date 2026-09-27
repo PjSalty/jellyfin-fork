@@ -1,0 +1,196 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 19:22:01 -0500
+Subject: [PATCH 12/13] migrations: materialise the ratings before
+ MigrateRatingLevels writes
+
+Intent: MigrateRatingLevels streamed the DISTINCT OfficialRating reader
+and ran two ExecuteUpdate statements per rating on the same connection
+while that reader was still open. SQLite allows it; Npgsql has no
+multiple active result sets and throws NpgsqlOperationInProgressException
+("A command is already in progress"), which fails the migration, rolls
+the database back from the pre-migration dump and exits the migration
+Job non-zero. 12.1 re-dated the routine (20260910120000), so every
+existing database runs it on the 12.1 upgrade. Materialise the distinct
+ratings with ToList() first; the rating set is small. Latent on an empty
+BaseItems table (no rows, no write while the reader is open), which is
+why an empty-library smoke never sees it. Includes a test that applies
+the PostgreSQL one-active-command rule to the SQLite connection through
+an interceptor (fails on stock 12.1).
+Ceiling: the routine's file name carries its date and upstream re-dates
+it whenever rating data changes, so this patch has to be rebased onto
+each re-dated file.
+Drop when: upstream materialises the query.
+
+Patch: 0020
+---
+ .../20260910120000_MigrateRatingLevels.cs     |   4 +-
+ .../Migrations/MigrateRatingLevelsTests.cs    | 141 ++++++++++++++++++
+ 2 files changed, 144 insertions(+), 1 deletion(-)
+ create mode 100644 tests/Jellyfin.Server.Tests/Migrations/MigrateRatingLevelsTests.cs
+
+diff --git a/Jellyfin.Server/Migrations/Routines/20260910120000_MigrateRatingLevels.cs b/Jellyfin.Server/Migrations/Routines/20260910120000_MigrateRatingLevels.cs
+index a456acf..cc6da6d 100644
+--- a/Jellyfin.Server/Migrations/Routines/20260910120000_MigrateRatingLevels.cs
++++ b/Jellyfin.Server/Migrations/Routines/20260910120000_MigrateRatingLevels.cs
+@@ -36,7 +36,9 @@ internal class MigrateRatingLevels : IDatabaseMigrationRoutine
+         _logger.LogInformation("Recalculating parental rating levels based on rating string.");
+         using var context = _provider.CreateDbContext();
+         using var transaction = context.Database.BeginTransaction();
+-        var ratings = context.BaseItems.AsNoTracking().Select(e => e.OfficialRating).Distinct();
++        // Materialised: the loop below writes on the same connection, and a provider without multiple active
++        // result sets (Npgsql) refuses a command while this reader is still open.
++        var ratings = context.BaseItems.AsNoTracking().Select(e => e.OfficialRating).Distinct().ToList();
+         foreach (var rating in ratings)
+         {
+             if (string.IsNullOrEmpty(rating))
+diff --git a/tests/Jellyfin.Server.Tests/Migrations/MigrateRatingLevelsTests.cs b/tests/Jellyfin.Server.Tests/Migrations/MigrateRatingLevelsTests.cs
+new file mode 100644
+index 0000000..06eead6
+--- /dev/null
++++ b/tests/Jellyfin.Server.Tests/Migrations/MigrateRatingLevelsTests.cs
+@@ -0,0 +1,141 @@
++using System;
++using System.Collections.Generic;
++using System.Data.Common;
++using System.Linq;
++using System.Threading;
++using Jellyfin.Database.Implementations;
++using Jellyfin.Database.Implementations.Entities;
++using Jellyfin.Database.Implementations.Locking;
++using Jellyfin.Database.Providers.Sqlite;
++using Jellyfin.Server.Migrations.Routines;
++using Jellyfin.Server.ServerSetupApp;
++using MediaBrowser.Common.Configuration;
++using MediaBrowser.Model.Entities;
++using MediaBrowser.Model.Globalization;
++using Microsoft.Data.Sqlite;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.EntityFrameworkCore.Diagnostics;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.Server.Tests.Migrations;
++
++/// <summary>
++/// SQLite lets a connection run a command while a reader on it is still open; PostgreSQL (Npgsql) refuses with
++/// "A command is already in progress". The interceptor applies the PostgreSQL rule here, so the routine is held to
++/// what the provider it actually runs against in multi-instance setups allows.
++/// </summary>
++public sealed class MigrateRatingLevelsTests : IDisposable
++{
++    private readonly SqliteConnection _connection;
++    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
++
++    public MigrateRatingLevelsTests()
++    {
++        _connection = new SqliteConnection("Data Source=:memory:");
++        _connection.Open();
++
++        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
++            .UseSqlite(_connection)
++            .AddInterceptors(new SingleActiveCommandInterceptor())
++            .Options;
++
++        using var context = CreateDbContext();
++        context.Database.EnsureCreated();
++    }
++
++    public void Dispose()
++    {
++        _connection.Dispose();
++    }
++
++    [Fact]
++    public void Perform_WritesWhileNoReaderIsOpen_ScoresEveryRating()
++    {
++        var pg13 = AddItem("PG-13");
++        var r = AddItem("R");
++        var unrated = AddItem(null);
++        var blank = AddItem(string.Empty);
++
++        CreateMigration().Perform();
++
++        using var context = CreateDbContext();
++        var scores = context.BaseItems.ToDictionary(e => e.Id, e => (e.InheritedParentalRatingValue, e.InheritedParentalRatingSubValue));
++        Assert.Equal((13, (int?)null), scores[pg13]);
++        Assert.Equal((17, (int?)1), scores[r]);
++        Assert.Equal(((int?)null, (int?)null), scores[unrated]);
++        Assert.Equal(((int?)null, (int?)null), scores[blank]);
++    }
++
++    private Guid AddItem(string? rating)
++    {
++        using var context = CreateDbContext();
++        var id = Guid.NewGuid();
++        context.BaseItems.Add(new BaseItemEntity
++        {
++            Id = id,
++            Type = "MediaBrowser.Controller.Entities.Movies.Movie",
++            OfficialRating = rating,
++            InheritedParentalRatingValue = 99,
++            InheritedParentalRatingSubValue = 99
++        });
++        context.SaveChanges();
++        return id;
++    }
++
++    private JellyfinDbContext CreateDbContext() => new(
++        _dbOptions,
++        NullLogger<JellyfinDbContext>.Instance,
++        new SqliteDatabaseProvider(Mock.Of<IApplicationPaths>(), NullLogger<SqliteDatabaseProvider>.Instance),
++        new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
++
++    private MigrateRatingLevels CreateMigration()
++    {
++        var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
++        factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
++        factory.Setup(f => f.CreateDbContextAsync(It.IsAny<CancellationToken>())).ReturnsAsync(CreateDbContext);
++
++        var localization = new Mock<ILocalizationManager>();
++        localization.Setup(l => l.GetRatingScore("PG-13", It.IsAny<string?>())).Returns(new ParentalRatingScore(13, null));
++        localization.Setup(l => l.GetRatingScore("R", It.IsAny<string?>())).Returns(new ParentalRatingScore(17, 1));
++
++        return new MigrateRatingLevels(
++            factory.Object,
++            new StartupLogger<MigrateRatingLevels>(NullLogger<MigrateRatingLevels>.Instance),
++            localization.Object);
++    }
++
++    private sealed class SingleActiveCommandInterceptor : DbCommandInterceptor
++    {
++        private readonly HashSet<DbDataReader> _openReaders = [];
++
++        public override DbDataReader ReaderExecuted(DbCommand command, CommandExecutedEventData eventData, DbDataReader result)
++        {
++            _openReaders.Add(result);
++            return result;
++        }
++
++        public override InterceptionResult DataReaderClosing(DbCommand command, DataReaderClosingEventData eventData, InterceptionResult result)
++        {
++            _openReaders.Remove(eventData.DataReader);
++            return result;
++        }
++
++        public override InterceptionResult DataReaderDisposing(DbCommand command, DataReaderDisposingEventData eventData, InterceptionResult result)
++        {
++            _openReaders.Remove(eventData.DataReader);
++            return result;
++        }
++
++        public override InterceptionResult<int> NonQueryExecuting(DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
++        {
++            if (_openReaders.Count > 0)
++            {
++                throw new InvalidOperationException("A command is already in progress: " + command.CommandText);
++            }
++
++            return result;
++        }
++    }
++}
+-- 
+2.55.0
+

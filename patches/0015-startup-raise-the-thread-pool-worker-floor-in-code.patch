@@ -1,26 +1,38 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Tue, 1 Sep 2026 08:41:29 -0500
-Subject: [PATCH] startup: raise the thread-pool worker floor in code
+Subject: [PATCH 07/13] startup: raise the thread-pool worker floor in code
 
-The 2026-08-27 stall had the pool's worker floor at the core count while
-EF cache writes blocked synchronously on Redis: bursts queued API work
-behind the pool's one-to-two threads per second ramp, p95 hit five
-seconds and webOS clients timed out. The env knob was already deployed
-and did nothing - DOTNET_ThreadPool_MinThreads=32 was ignored without a
-word, and the DOTNET_/COMPlus_ config family also parses numbers as hex,
-so that route is two silent failure modes in one. Raise the floor to
-max(32, current) in code instead, completion-port floor untouched, and
-log the before and after values at Information: "worker floor raised"
-greppable from the pod log is the contract that the floor is real. 32 is
-the 2026-08-29 load measurement.
+Intent: the 2026-08-27 stall had the pool's worker floor at the core
+count while EF cache writes blocked synchronously on Redis: bursts
+queued API work behind the pool's one-to-two threads per second ramp,
+p95 hit five seconds and webOS clients timed out. The env knob was
+already deployed and did nothing: DOTNET_ThreadPool_MinThreads=32 was
+ignored without a word. Raise the floor to max(32, current) in code
+instead, completion-port floor untouched, and log the before and after
+values at Information: "worker floor raised" greppable from the pod log
+is the contract that the floor is real. 32 is the 2026-08-29 load
+measurement. It runs in every startup mode, the migration Job included.
+Carried onto 12.x (.NET 10) with one change: the method is now
+EnsureThreadPoolFloor, because a Raise* name trips CA1030 ("use events")
+in Debug builds on the 12.x analyzer set. 12.x item code is still
+largely synchronous EF, so a burst still blocks pool threads per round
+trip.
+Ceiling: a forced runtime floor (runtimeconfig
+System.Threading.ThreadPool.MinThreads or its environment twin) makes
+SetMinThreads refuse any other value; the Warning line then replaces
+the Information line, which the smoke assertion catches.
+Drop when: the runtime raises its default floor above the core count or
+logs the effective floor, or upstream sets the floor itself.
+
+Patch: 0015
 ---
  Jellyfin.Server/Helpers/StartupHelpers.cs | 28 +++++++++++++++++++++++
  Jellyfin.Server/Program.cs                |  1 +
  2 files changed, 29 insertions(+)
 
 diff --git a/Jellyfin.Server/Helpers/StartupHelpers.cs b/Jellyfin.Server/Helpers/StartupHelpers.cs
-index 93c9961..c331986 100644
+index 93c9961..210832a 100644
 --- a/Jellyfin.Server/Helpers/StartupHelpers.cs
 +++ b/Jellyfin.Server/Helpers/StartupHelpers.cs
 @@ -6,6 +6,7 @@ using System.Linq;
@@ -40,7 +52,7 @@ index 93c9961..c331986 100644
 +    /// Raises the worker-thread floor of the managed thread pool.
 +    /// </summary>
 +    /// <param name="logger">The logger to use.</param>
-+    public static void RaiseThreadPoolFloor(ILogger logger)
++    public static void EnsureThreadPoolFloor(ILogger logger)
 +    {
 +        // DOTNET_ThreadPool_MinThreads was in place and silently ignored: the
 +        // runtime gives no feedback when it drops a config knob, and the
@@ -64,14 +76,14 @@ index 93c9961..c331986 100644
 +    }
  }
 diff --git a/Jellyfin.Server/Program.cs b/Jellyfin.Server/Program.cs
-index 248f61d..e6930ff 100644
+index 715fc3d..50fc05d 100644
 --- a/Jellyfin.Server/Program.cs
 +++ b/Jellyfin.Server/Program.cs
-@@ -114,6 +114,7 @@ namespace Jellyfin.Server
+@@ -115,6 +115,7 @@ namespace Jellyfin.Server
                  Assembly.GetEntryAssembly()!.GetName().Version!.ToString(3));
  
              StartupHelpers.LogEnvironmentInfo(_logger, appPaths);
-+            StartupHelpers.RaiseThreadPoolFloor(_logger);
++            StartupHelpers.EnsureThreadPoolFloor(_logger);
  
              // If hosting the web client, validate the client content path
              if (startupConfig.HostWebClient())

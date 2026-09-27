@@ -1,18 +1,26 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Sat, 11 Jul 2026 08:18:32 -0500
-Subject: [PATCH 5/5] devices: read through to the database on token cache miss
+Subject: [PATCH 04/13] devices: read through to the database on token cache
+ miss
 
 Intent: tokens minted by another replica authenticate here: the device/
 token lookup re-checks the database once on a cache miss and populates
-the cache, rejecting only when the database also misses.
+the cache, rejecting only when the database also misses. Carried
+unchanged onto 12.x; the new Limit > 0 guard and the ExecuteDeleteAsync
+in DeleteDevice sit outside the patched lookup and do not change it.
+Ceiling: only misses read through. A cached device is trusted until
+this process restarts, so a token revoked (logout, device delete) on
+one replica stays valid on another replica that already cached it.
 Drop when: upstream makes the token path DB-backed.
+
+Patch: 0005
 ---
  .../Devices/DeviceManager.cs                  | 36 +++++++++++++++----
  1 file changed, 29 insertions(+), 7 deletions(-)
 
 diff --git a/Jellyfin.Server.Implementations/Devices/DeviceManager.cs b/Jellyfin.Server.Implementations/Devices/DeviceManager.cs
-index 51a1186..f76bb11 100644
+index d0d52a2..18a63f7 100644
 --- a/Jellyfin.Server.Implementations/Devices/DeviceManager.cs
 +++ b/Jellyfin.Server.Implementations/Devices/DeviceManager.cs
 @@ -145,13 +145,25 @@ namespace Jellyfin.Server.Implementations.Devices

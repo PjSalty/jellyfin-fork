@@ -1,7 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Sat, 5 Sep 2026 10:37:08 -0500
-Subject: [PATCH] mediainfo: drop unprobed lossless audio direct play claims
+Subject: [PATCH 11/13] mediainfo: drop unprobed lossless audio direct play
+ claims
 
 Intent: the Android TV client (0.19.9/0.19.10, the version on all three
 Fire TV Sticks here) probes VIDEO codecs against MediaCodecList and then
@@ -35,8 +36,18 @@ audio is left alone rather than guessed at. Only the POSTed profile is
 corrected; the stored capabilities object is shared state and is not
 mutated as a side effect of a playback request.
 
+Carried unchanged onto 12.x: the hook lands before the capabilities
+fallback and item lookup of GetPostedPlaybackInfo exactly as on
+10.11.11, and 12.x adds no server-side audio policy of its own.
+Ceiling: only a POSTed profile is corrected; a POST without a profile
+falls back to the stored capabilities, which keep the client's claims.
+
 Drop when: the Android TV client probes audio decoders the way it
-probes video, or Jellyfin gains a server-side per-client audio policy.
+probes video (jellyfin-androidtv PR 5645, in the 0.20.0 pre-releases,
+is that change; drop once the clients in use run a release carrying
+it), or Jellyfin gains a server-side per-client audio policy.
+
+Patch: 0019
 ---
  .../Controllers/MediaInfoController.cs        |  17 +++
  .../Helpers/ClientAudioProfileSanitizer.cs    | 107 ++++++++++++++++++
@@ -46,7 +57,7 @@ probes video, or Jellyfin gains a server-side per-client audio policy.
  create mode 100644 tests/Jellyfin.Api.Tests/Helpers/ClientAudioProfileSanitizerTests.cs
 
 diff --git a/Jellyfin.Api/Controllers/MediaInfoController.cs b/Jellyfin.Api/Controllers/MediaInfoController.cs
-index f22ac0b..2b6578d 100644
+index aa942e7..95f8f2c 100644
 --- a/Jellyfin.Api/Controllers/MediaInfoController.cs
 +++ b/Jellyfin.Api/Controllers/MediaInfoController.cs
 @@ -137,6 +137,23 @@ public class MediaInfoController : BaseJellyfinApiController
@@ -274,3 +285,6 @@ index 0000000..380fa60
 +            };
 +    }
 +}
+-- 
+2.55.0
+
