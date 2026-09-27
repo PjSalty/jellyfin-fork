@@ -116,6 +116,26 @@ if [ -z "${zero_count}" ] || [ "${zero_count}" = "null" ]; then
     die "Limit=0 returned no TotalRecordCount: the early return skipped the count too"
 fi
 
+info "asserting the Latest row answers an empty cutoff with an empty array (patch 0010)"
+# GetLatestItemList now reads the top-N DateCreated cutoff as its own statement and
+# returns early when no group matched. With no media that early return is the ONLY
+# branch this suite can reach, so assert its shape: 200 with a JSON array, not a 500
+# or null. The same-items-before-and-after check needs a library; the live-DB run
+# that measured the change compared ids on a populated one.
+latest="$(curl -sf "${LEADER_URL}/Users/${user_id}/Items/Latest?Limit=16" \
+    -H "X-Emby-Token: ${token}")" || die "Items/Latest failed outright"
+[ "$(echo "${latest}" | jq -r 'type')" = "array" ] || die "Items/Latest did not return an array"
+
+info "asserting a Season listing with user data still answers (patch 0011)"
+# Season.GetItemsInternal takes a repository count for the Limit=0 shape that
+# Folder.FillUserDataDtoValues issues per Season DTO. Without media no Season exists,
+# so this only proves the listing path that would build those DTOs still answers 200
+# with an Items array; a populated library is needed to compare UnplayedItemCount
+# against the in-memory path (the live-DB run checked membership across 710 seasons).
+seasons="$(curl -sf "${LEADER_URL}/Users/${user_id}/Items?Recursive=true&IncludeItemTypes=Season&Limit=2000" \
+    -H "X-Emby-Token: ${token}")" || die "Season listing failed outright"
+[ "$(echo "${seasons}" | jq -r '.Items | type')" = "array" ] || die "Season listing returned no Items array"
+
 info "asserting a user update DELETES old permissions instead of orphaning them (patch 0006)"
 # Regression guard. Permission.UserId / Preference.UserId are Guid? (optional), so
 # UpdateUserAsync's dbUser.Permissions.Clear() makes EF SEVER the relationship

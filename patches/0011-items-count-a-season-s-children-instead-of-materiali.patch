@@ -1,0 +1,211 @@
+From 92ac1b1b01022d34bc218ca238ad7060efd8cd09 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sat, 29 Aug 2026 12:54:54 -0500
+Subject: [PATCH 11/11] items: count a season's children instead of
+ materialising the series
+
+Season.GetItemsInternal answers every query with a user by fetching every
+episode of the whole series (Series.GetSeasonEpisodes), then filtering the
+season out in memory and applying Limit, IsPlayed and IsVirtualItem there too.
+Folder.FillUserDataDtoValues asks each Season DTO for its unplayed count with a
+Limit=0 query, so a season strip for a 37-season show fetches the series 37
+times, each fetch carrying every user's UserData rows. On a live library that
+single statement was 1.62M calls at 20.5 ms, 55% of all database time, almost
+all of it from listings that wanted one number per season.
+
+The repository already has a count-only path for Limit=0 (it counts distinct
+PresentationUniqueKeys and never fetches a row), but Season never reached it.
+Hand it the predicate FilterEpisodesBySeason applies in memory:
+
+  ParentIndexNumber = N, or SeasonId points at a Season row with this season's
+  PresentationUniqueKey
+
+expressed as a new InternalItemsQuery.SeasonMembership filter. The shortcut is
+taken only for the count shape (Limit=0, EnableTotalRecordCount, no parent or
+id scoping, Episode or untyped, nothing Folder would post-filter in memory),
+only with DisplaySpecialsWithinSeasons on (the branch that queries by series
+key), and only when the season has a number. Any other query keeps the
+in-memory path.
+
+AirsBefore/AirsAfterSeasonNumber move an episode into another season's listing
+and live in the Data blob, so a series carrying any keeps the in-memory path
+too; HasAiredSeasonOverride is the guard, a LIKE on the property name, which
+is exact because Data is written with nulls omitted. Folder.RequiresPostFiltering
+becomes protected so Season can ask the same question the base recursion asks.
+
+Measured on the live library, worst case (1,022-episode series), warm cache:
+
+  in-memory path   38 ms   12,292 buffers, 1,022 full rows serialised
+  guard + count    12 ms    2,457 buffers, one row
+
+Membership was checked across all 710 numbered seasons: every episode with a
+numbered season is a member of the season its number names or the one its
+SeasonId points at, the same two tests the in-memory filter runs. Counts still
+differ from the in-memory path in two cases the fork accepts: duplicate episode
+keys with different Played state per copy (none here), and items the SQL
+parental filter admits but BaseItem.IsVisible would not (the same gap Series
+counts have had all along).
+---
+ .../Item/BaseItemRepository.cs                | 16 +++++
+ MediaBrowser.Controller/Entities/Folder.cs    |  2 +-
+ .../Entities/InternalItemsQuery.cs            | 16 +++++
+ MediaBrowser.Controller/Entities/TV/Season.cs | 69 +++++++++++++++++++
+ 4 files changed, 102 insertions(+), 1 deletion(-)
+
+diff --git a/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs b/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
+index 648750cf..bf1fa9c6 100644
+--- a/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
++++ b/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
+@@ -1988,6 +1988,22 @@ public sealed class BaseItemRepository
+             baseQuery = baseQuery.Where(e => e.ParentIndexNumber != filter.ParentIndexNumberNotEquals.Value || e.ParentIndexNumber == null);
+         }
+ 
++        if (filter.SeasonMembership.HasValue)
++        {
++            var (seasonNumber, seasonKey) = filter.SeasonMembership.Value;
++            baseQuery = baseQuery.Where(e => e.ParentIndexNumber == seasonNumber
++                || context.BaseItems.Any(s => s.Id == e.SeasonId && s.PresentationUniqueKey == seasonKey));
++        }
++
++        if (filter.HasAiredSeasonOverride.HasValue)
++        {
++            // Data is written with JsonDefaults (nulls omitted), so the property name being
++            // present is the same as the override being set.
++            baseQuery = baseQuery.Where(e => (e.Data != null
++                && (EF.Functions.Like(e.Data, "%\"AirsAfterSeasonNumber\":%")
++                    || EF.Functions.Like(e.Data, "%\"AirsBeforeSeasonNumber\":%"))) == filter.HasAiredSeasonOverride.Value);
++        }
++
+         var minEndDate = filter.MinEndDate;
+         var maxEndDate = filter.MaxEndDate;
+ 
+diff --git a/MediaBrowser.Controller/Entities/Folder.cs b/MediaBrowser.Controller/Entities/Folder.cs
+index 2ecb6cbd..ec7bbc46 100644
+--- a/MediaBrowser.Controller/Entities/Folder.cs
++++ b/MediaBrowser.Controller/Entities/Folder.cs
+@@ -820,7 +820,7 @@ namespace MediaBrowser.Controller.Entities
+             return false;
+         }
+ 
+-        private bool RequiresPostFiltering(InternalItemsQuery query)
++        protected bool RequiresPostFiltering(InternalItemsQuery query)
+         {
+             if (LinkedChildren.Length > 0)
+             {
+diff --git a/MediaBrowser.Controller/Entities/InternalItemsQuery.cs b/MediaBrowser.Controller/Entities/InternalItemsQuery.cs
+index 076a5929..9239add0 100644
+--- a/MediaBrowser.Controller/Entities/InternalItemsQuery.cs
++++ b/MediaBrowser.Controller/Entities/InternalItemsQuery.cs
+@@ -233,6 +233,22 @@ namespace MediaBrowser.Controller.Entities
+ 
+         public int? ParentIndexNumberNotEquals { get; set; }
+ 
++        /// <summary>
++        /// Gets or sets the season an episode has to belong to: its ParentIndexNumber is the
++        /// number, or its SeasonId points at a Season row with that PresentationUniqueKey.
++        /// </summary>
++        /// <remarks>
++        /// The SQL form of <c>Series.FilterEpisodesBySeason</c>. AirsBefore/AirsAfter relocation
++        /// is not part of it (those live in the Data blob); see <see cref="HasAiredSeasonOverride"/>.
++        /// </remarks>
++        public (int ParentIndexNumber, string SeasonPresentationUniqueKey)? SeasonMembership { get; set; }
++
++        /// <summary>
++        /// Gets or sets a value indicating whether an episode carries an AirsBeforeSeasonNumber or
++        /// AirsAfterSeasonNumber override, which moves it into another season's listing.
++        /// </summary>
++        public bool? HasAiredSeasonOverride { get; set; }
++
+         public int? IndexNumber { get; set; }
+ 
+         public ParentalRatingScore? MinParentalRating { get; set; }
+diff --git a/MediaBrowser.Controller/Entities/TV/Season.cs b/MediaBrowser.Controller/Entities/TV/Season.cs
+index 4360253b..15278da5 100644
+--- a/MediaBrowser.Controller/Entities/TV/Season.cs
++++ b/MediaBrowser.Controller/Entities/TV/Season.cs
+@@ -175,6 +175,12 @@ namespace MediaBrowser.Controller.Entities.TV
+ 
+             var user = query.User;
+ 
++            var counted = TryCountEpisodes(query);
++            if (counted is not null)
++            {
++                return counted;
++            }
++
+             Func<BaseItem, bool> filter = i => UserViewBuilder.Filter(i, user, query, UserDataManager, LibraryManager);
+ 
+             var items = GetEpisodes(user, query.DtoOptions, true).Where(filter);
+@@ -182,6 +188,69 @@ namespace MediaBrowser.Controller.Entities.TV
+             return PostFilterAndSort(items, query);
+         }
+ 
++        /// <summary>
++        /// Answers a count-only query with a repository count instead of materialising the series.
++        /// </summary>
++        /// <remarks>
++        /// 2026-08-29: Folder.FillUserDataDtoValues asks every Season DTO for its unplayed count as a
++        /// Limit=0 query. The user branch above fetches every episode of the whole series, joined to
++        /// every user's UserData, and filters the season out in memory, so a 37-season show pays 37
++        /// full-series fetches per listing; that one statement was 55% of all database time. The
++        /// repository's Limit=0 path counts distinct PresentationUniqueKeys without fetching a row,
++        /// so hand it the predicate FilterEpisodesBySeason applies in memory. Returns null when the
++        /// query is not the count-only shape or the predicate cannot be expressed in SQL.
++        /// </remarks>
++        /// <param name="query">The query.</param>
++        /// <returns>The count result, or null to take the in-memory path.</returns>
++        private QueryResult<BaseItem> TryCountEpisodes(InternalItemsQuery query)
++        {
++            if (query.Limit != 0
++                || !query.EnableTotalRecordCount
++                || !IndexNumber.HasValue
++                || query.IsFolder == true
++                || !query.ParentId.IsEmpty()
++                || query.AncestorIds.Length > 0
++                || query.TopParentIds.Length > 0
++                || query.ItemIds.Length > 0
++                || query.ChannelIds.Count > 0
++                || query.ExcludeItemTypes.Length > 0
++                || (query.IncludeItemTypes.Length > 0 && !(query.IncludeItemTypes.Length == 1 && query.IncludeItemTypes[0] == BaseItemKind.Episode))
++                || RequiresPostFiltering(query)
++                || !ConfigurationManager.Configuration.DisplaySpecialsWithinSeasons)
++            {
++                return null;
++            }
++
++            var series = Series;
++            if (series is null || series.SourceType == SourceType.Channel)
++            {
++                return null;
++            }
++
++            var seriesKey = series.GetPresentationUniqueKey();
++
++            // AirsBefore/AirsAfter move an episode into another season's listing (FilterEpisodesBySeason
++            // reads AiredSeasonNumber for every season but specials). They live in the Data blob, so a
++            // series carrying any keeps the in-memory path.
++            if (IndexNumber.Value != 0
++                && LibraryManager.GetCount(new InternalItemsQuery
++                {
++                    SeriesPresentationUniqueKey = seriesKey,
++                    IncludeItemTypes = [BaseItemKind.Episode],
++                    HasAiredSeasonOverride = true
++                }) > 0)
++            {
++                return null;
++            }
++
++            query.AncestorWithPresentationUniqueKey = null;
++            query.SeriesPresentationUniqueKey = seriesKey;
++            query.IncludeItemTypes = [BaseItemKind.Episode];
++            query.SeasonMembership = (IndexNumber.Value, GetPresentationUniqueKey());
++
++            return LibraryManager.GetItemsResult(query);
++        }
++
+         /// <summary>
+         /// Gets the episodes.
+         /// </summary>
+-- 
+2.55.0
+

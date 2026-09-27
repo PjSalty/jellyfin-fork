@@ -1,0 +1,67 @@
+From 76e8f4cd22a29c3d45115b4375abd59b3b992147 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sat, 29 Aug 2026 12:54:54 -0500
+Subject: [PATCH 10/11] items: latest, read the date cutoff before the item
+ query
+
+GetLatestItemList finds the top-N series (or albums) by newest DateCreated and
+then fetches every item created on or after the oldest of those. It expressed
+the "oldest of those" as a scalar subquery inlined into the item query's WHERE
+clause. ApplyGroupingFilter then wraps that WHERE twice: once in the correlated
+subquery that picks a representative id per PresentationUniqueKey, and once in
+the group scan that drives it. So the expensive part, an index-only scan over
+the series-latest cover index with a per-row UserData Played SubPlan (~8,000
+loops), ran twice per statement, and the plan spilled to temp.
+
+Read the cutoff into a value first and filter the item query on the parameter.
+Same predicates, same rows, same order; the only change is statement shape.
+An empty cutoff means no group matched, which the inlined form answered with
+`DateCreated >= NULL`, i.e. no rows, so return nothing without a second query.
+
+Measured on a live library (PostgreSQL 18, 48k items), admin user, TV Shows
+root, Limit=16:
+
+  inlined            130-139 ms   62,796 buffers + 1,813 temp blocks
+  cutoff + items      59-78 ms    16,660 + 29,600 buffers, no temp
+
+The two Latest statements ran ~38 and ~18 times an hour at 171 ms and 260 ms
+mean (264 s/day of database time between them), and they sit behind every
+home-screen Latest row for tvshows and music libraries.
+---
+ .../Item/BaseItemRepository.cs                   | 16 +++++++++++++++-
+ 1 file changed, 15 insertions(+), 1 deletion(-)
+
+diff --git a/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs b/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
+index cbbddf89..648750cf 100644
+--- a/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
++++ b/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
+@@ -371,11 +371,25 @@ public sealed class BaseItemRepository
+             subqueryGrouped = subqueryGrouped.Take(filter.Limit.Value);
+         }
+ 
++        // 2026-08-29: read the cutoff first, then filter the item query on the value.
++        // Inlined as a scalar subquery, the top-N scan (an index-only scan carrying a
++        // per-row UserData SubPlan) was planned inside the grouping wrapper, so it ran
++        // once in the correlated representative subquery and once in the group scan and
++        // spilled to temp; 130-139 ms -> 59-78 ms for a Limit=16 TV row on a live library.
++        // Two statements on one context; a row landing between them is re-limited by the
++        // caller. An empty cutoff is an empty library (or one with no DateCreated), which
++        // the inlined form answered with `>= NULL`, i.e. no rows.
++        var cutoff = subqueryGrouped.Select(s => s.MaxDateCreated).Min();
++        if (cutoff is null)
++        {
++            return Array.Empty<BaseItem>();
++        }
++
+         filter.Limit = null;
+ 
+         var mainquery = PrepareItemQuery(context, filter);
+         mainquery = TranslateQuery(mainquery, context, filter);
+-        mainquery = mainquery.Where(g => g.DateCreated >= subqueryGrouped.Min(s => s.MaxDateCreated));
++        mainquery = mainquery.Where(g => g.DateCreated >= cutoff);
+         mainquery = ApplyGroupingFilter(context, mainquery, filter);
+         mainquery = ApplyQueryPaging(mainquery, filter);
+ 
+-- 
+2.55.0
+
