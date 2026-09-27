@@ -1,20 +1,23 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 19:08:40 -0500
-Subject: [PATCH 01/13] migrations: skip-gate for replica processes
+Subject: [PATCH 01/15] migrations: skip-gate for replica processes
 
 Intent: JELLYFIN_SKIP_MIGRATIONS=true turns migration execution into a
 checkpoint: zero pending means one info line and normal startup; any
 pending fails fast naming the count and pointing at the migration Job
 (--mode MigrateSystem). Replicas set the env, the Job does not, so the
-Job's migrate path is untouched. "Pending" is read from the same
-sources the runner uses: the history table, the migrations assembly the
-active provider configures (an external provider such as the PostgreSQL
-plugin brings its own) and the code migrations of every stage, not only
-the stage being entered. Ported onto the 12.x MigrateStepAsync, which
-now returns whether anything was applied: a gated process applied
-nothing and returns false, so it never triggers the post-migration
-database optimisation on a replica boot. Includes the gate tests.
+Job's migrate path is untouched. "Pending" is read from the same sources
+the runner uses: the history table, the migrations assembly the active
+provider configures (an external provider such as the PostgreSQL plugin
+brings its own) and the code migrations of every stage, not only the
+stage being entered. Ported onto the 12.x MigrateStepAsync, which now
+returns whether anything was applied: a gated process applied nothing
+and returns false, so it never triggers the post-migration database
+optimisation on a replica boot. The pass is cached per service instance,
+not per process: Program builds a new service for each in-process
+restart, so a restart after a backup restore checks the restored history
+again. Includes the gate tests.
 Ceiling: the gate compares history with the migrations assembly, not
 the runtime model with the schema; a provider whose migrations lag the
 model passes it (EF does not check pending model changes for Jellyfin's
@@ -24,16 +27,16 @@ Drop when: upstream grows an equivalent gate.
 
 Patch: 0002
 ---
- .../Migrations/JellyfinMigrationService.cs    |  46 +++++
- .../Migrations/SkipMigrationsGateTests.cs     | 177 ++++++++++++++++++
- 2 files changed, 223 insertions(+)
+ .../Migrations/JellyfinMigrationService.cs    |  48 +++++
+ .../Migrations/SkipMigrationsGateTests.cs     | 190 ++++++++++++++++++
+ 2 files changed, 238 insertions(+)
  create mode 100644 tests/Jellyfin.Server.Tests/Migrations/SkipMigrationsGateTests.cs
 
 diff --git a/Jellyfin.Server/Migrations/JellyfinMigrationService.cs b/Jellyfin.Server/Migrations/JellyfinMigrationService.cs
-index a5b6bc4..b25e6f0 100644
+index a5b6bc4..5978ade 100644
 --- a/Jellyfin.Server/Migrations/JellyfinMigrationService.cs
 +++ b/Jellyfin.Server/Migrations/JellyfinMigrationService.cs
-@@ -28,12 +28,14 @@ namespace Jellyfin.Server.Migrations;
+@@ -28,12 +28,16 @@ namespace Jellyfin.Server.Migrations;
  internal class JellyfinMigrationService
  {
      private const string DbFilename = "library.db";
@@ -44,11 +47,13 @@ index a5b6bc4..b25e6f0 100644
      private readonly IBackupService? _backupService;
      private readonly IJellyfinDatabaseProvider? _jellyfinDatabaseProvider;
      private readonly IApplicationPaths _applicationPaths;
-+    private static bool _skipGatePassed;
++    // Per instance, not static: Program builds a new service for every StartServer pass, so an
++    // in-process restart (after a backup restore rewrote the history) checks the gate again.
++    private bool _skipGatePassed;
      private (string? LibraryDb, string? JellyfinDb, BackupManifestDto? FullBackup) _backupKey;
  
      /// <summary>
-@@ -191,6 +193,14 @@ internal class JellyfinMigrationService
+@@ -191,6 +195,14 @@ internal class JellyfinMigrationService
      /// <returns>A value indicating whether at least one migration has been applied.</returns>
      public async Task<bool> MigrateStepAsync(JellyfinMigrationStageTypes stage, IServiceProvider serviceProvider)
      {
@@ -63,7 +68,7 @@ index a5b6bc4..b25e6f0 100644
          var logger = _startupLogger.With(_loggerFactory.CreateLogger<JellyfinMigrationService>()).BeginGroup($"Migrate stage {stage}.");
          ICollection<CodeMigration> migrationStage = (Migrations.FirstOrDefault(e => e.Stage == stage) as ICollection<CodeMigration>) ?? [];
  
-@@ -313,6 +323,42 @@ internal class JellyfinMigrationService
+@@ -313,6 +325,42 @@ internal class JellyfinMigrationService
          return Assembly.GetEntryAssembly()!.GetName().Version!.ToString();
      }
  
@@ -108,10 +113,10 @@ index a5b6bc4..b25e6f0 100644
          if (_backupKey != default)
 diff --git a/tests/Jellyfin.Server.Tests/Migrations/SkipMigrationsGateTests.cs b/tests/Jellyfin.Server.Tests/Migrations/SkipMigrationsGateTests.cs
 new file mode 100644
-index 0000000..3f9d0e2
+index 0000000..1b3a1e4
 --- /dev/null
 +++ b/tests/Jellyfin.Server.Tests/Migrations/SkipMigrationsGateTests.cs
-@@ -0,0 +1,177 @@
+@@ -0,0 +1,190 @@
 +using System;
 +using System.Collections.Generic;
 +using System.Linq;
@@ -150,9 +155,8 @@ index 0000000..3f9d0e2
 +
 +    public SkipMigrationsGateTests()
 +    {
-+        // The variable and the gate's pass flag are process-wide; tests in one class never run in parallel.
++        // The variable is process-wide; tests in one class never run in parallel.
 +        _previousValue = Environment.GetEnvironmentVariable(SkipMigrationsVariable);
-+        ResetGate();
 +
 +        _connection = new SqliteConnection("Data Source=:memory:");
 +        _connection.Open();
@@ -167,7 +171,6 @@ index 0000000..3f9d0e2
 +    public void Dispose()
 +    {
 +        Environment.SetEnvironmentVariable(SkipMigrationsVariable, _previousValue);
-+        ResetGate();
 +        _connection.Dispose();
 +    }
 +
@@ -214,6 +217,26 @@ index 0000000..3f9d0e2
 +    }
 +
 +    [Fact]
++    public async Task MigrateStep_GatePassedThenHistoryRolledBack_NewServiceThrows()
++    {
++        await ApplyProbeMigrationAsync();
++        await StampCodeMigrationsAsync(null);
++        Environment.SetEnvironmentVariable(SkipMigrationsVariable, "true");
++        Assert.False(await CreateService().MigrateStepAsync(JellyfinMigrationStageTypes.CoreInitialisation, EmptyServices()));
++
++        // A backup restore rewrites the history to an older set, then Program restarts in-process with a new service.
++        using (var context = CreateDbContext())
++        {
++            var historyRepository = context.GetService<IHistoryRepository>();
++            await context.Database.ExecuteSqlRawAsync(historyRepository.GetDeleteScript(SkipGateProbeMigration.Id), Ct);
++        }
++
++        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
++            () => CreateService().MigrateStepAsync(JellyfinMigrationStageTypes.CoreInitialisation, EmptyServices()));
++        Assert.Contains("there are 1 pending migrations", ex.Message, StringComparison.Ordinal);
++    }
++
++    [Fact]
 +    public async Task MigrateStep_GateUnset_RunsThePendingMigration()
 +    {
 +        await StampCodeMigrationsAsync(null);
@@ -225,11 +248,6 @@ index 0000000..3f9d0e2
 +        using var context = CreateDbContext();
 +        Assert.Contains(SkipGateProbeMigration.Id, await context.Database.GetAppliedMigrationsAsync(Ct));
 +    }
-+
-+    private static void ResetGate()
-+        => typeof(JellyfinMigrationService)
-+            .GetField("_skipGatePassed", BindingFlags.NonPublic | BindingFlags.Static)!
-+            .SetValue(null, false);
 +
 +    private static IServiceProvider EmptyServices() => new ServiceCollection().BuildServiceProvider();
 +
