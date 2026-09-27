@@ -1,0 +1,276 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sat, 5 Sep 2026 10:37:08 -0500
+Subject: [PATCH] mediainfo: drop unprobed lossless audio direct play claims
+
+Intent: the Android TV client (0.19.9/0.19.10, the version on all three
+Fire TV Sticks here) probes VIDEO codecs against MediaCodecList and then
+declares aac, ac3, eac3, dts, dca, mlp, truehd, flac, opus and pcm for
+direct play UNCONDITIONALLY. The server believes it, selects DirectPlay
+for TrueHD-Atmos and DTS-HD MA titles, and never runs ffmpeg, so a
+failure leaves nothing server-side to find: Loki has zero non-zero
+ffmpeg exits for the whole window. ExoPlayer cannot decode TrueHD and
+plays DTS-HD only as its lossy core, so the stream dies in the client
+and the app restarts it mid-film. On one Stick both DTS-HD-MA-only films
+show exactly that: a mid-film stop and a restart 1 to 3 seconds later
+with segment sums equal to runtime, while every AC3 title on the same
+device played straight through. 664 items in this library have no lossy
+fallback track, and a fallback track would not have helped anyway:
+Jellyfin still picks the default lossless track while the client claims
+it can play it.
+
+Jellyfin has no server-side audio passthrough or allowed-encoder
+setting, so the only place to correct a false claim is where the claim
+arrives. GetPostedPlaybackInfo now strips truehd, mlp, dts and dca from
+the direct play profiles of clients whose audio support is known to be
+unprobed, which forces the normal transcode path (ac3/eac3/aac from the
+client's own TranscodingProfile). EAC3-Atmos is untouched: it is a JOC
+extension over a normal eac3 5.1 core and plays wherever eac3 does,
+which is why some Atmos titles always worked.
+
+A direct play entry whose codec list empties out is DROPPED rather than
+left with an empty AudioCodec, because empty means "any codec" and would
+hand back the exact claim being removed. An entry that never constrained
+audio is left alone rather than guessed at. Only the POSTed profile is
+corrected; the stored capabilities object is shared state and is not
+mutated as a side effect of a playback request.
+
+Drop when: the Android TV client probes audio decoders the way it
+probes video, or Jellyfin gains a server-side per-client audio policy.
+---
+ .../Controllers/MediaInfoController.cs        |  17 +++
+ .../Helpers/ClientAudioProfileSanitizer.cs    | 107 ++++++++++++++++++
+ .../ClientAudioProfileSanitizerTests.cs       |  82 ++++++++++++++
+ 3 files changed, 206 insertions(+)
+ create mode 100644 Jellyfin.Api/Helpers/ClientAudioProfileSanitizer.cs
+ create mode 100644 tests/Jellyfin.Api.Tests/Helpers/ClientAudioProfileSanitizerTests.cs
+
+diff --git a/Jellyfin.Api/Controllers/MediaInfoController.cs b/Jellyfin.Api/Controllers/MediaInfoController.cs
+index f22ac0b..2b6578d 100644
+--- a/Jellyfin.Api/Controllers/MediaInfoController.cs
++++ b/Jellyfin.Api/Controllers/MediaInfoController.cs
+@@ -137,6 +137,23 @@ public class MediaInfoController : BaseJellyfinApiController
+         var profile = playbackInfoDto?.DeviceProfile;
+         _logger.LogDebug("GetPostedPlaybackInfo profile: {@Profile}", profile);
+ 
++        // The posted profile is trusted as a statement of what the client can
++        // decode, but the Android TV client does not probe audio at all: it
++        // probes video against MediaCodecList and then declares truehd, mlp,
++        // dts and dca unconditionally. The server then picks DirectPlay for a
++        // TrueHD or DTS-HD title, never runs ffmpeg, and the stream dies in
++        // the client with nothing server-side to find. Only the posted profile
++        // is corrected here; the stored capabilities object is shared state
++        // and is not mutated as a side effect of a playback request.
++        var stripped = ClientAudioProfileSanitizer.StripUnverifiedLosslessAudio(profile, User.GetClient());
++        if (stripped > 0)
++        {
++            _logger.LogInformation(
++                "Removed unverified lossless audio direct play claims from {Count} profile(s) for client {Client}",
++                stripped,
++                User.GetClient());
++        }
++
+         if (profile is null)
+         {
+             var caps = _deviceManager.GetCapabilities(User.GetDeviceId());
+diff --git a/Jellyfin.Api/Helpers/ClientAudioProfileSanitizer.cs b/Jellyfin.Api/Helpers/ClientAudioProfileSanitizer.cs
+new file mode 100644
+index 0000000..515cbcf
+--- /dev/null
++++ b/Jellyfin.Api/Helpers/ClientAudioProfileSanitizer.cs
+@@ -0,0 +1,107 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using MediaBrowser.Model.Dlna;
++
++namespace Jellyfin.Api.Helpers;
++
++/// <summary>
++/// Removes direct play claims a client makes without ever asking the platform
++/// whether it can decode the codec.
++/// </summary>
++public static class ClientAudioProfileSanitizer
++{
++    /// <summary>
++    /// Lossless audio codecs the Android TV client advertises unconditionally.
++    /// Its device profile probes VIDEO codecs against MediaCodecList and then
++    /// declares this audio set regardless of what the device or the HDMI sink
++    /// can actually do.
++    /// </summary>
++    private static readonly string[] _unverifiedLosslessAudioCodecs =
++    [
++        "truehd",
++        "mlp",
++        "dts",
++        "dca",
++        "dtshd",
++        "dts-hd",
++        "dtshd_ma"
++    ];
++
++    /// <summary>
++    /// Clients whose audio direct play claims are not probed.
++    /// </summary>
++    private static readonly string[] _unprobedClients =
++    [
++        "Android TV",
++        "AndroidTV",
++        "Fire TV",
++        "FireTV"
++    ];
++
++    /// <summary>
++    /// Strips unverified lossless audio codecs from a client's direct play profiles.
++    /// </summary>
++    /// <param name="profile">The device profile the client supplied.</param>
++    /// <param name="client">The client name from the access token claims.</param>
++    /// <returns>The number of direct play profiles changed or dropped.</returns>
++    public static int StripUnverifiedLosslessAudio(DeviceProfile? profile, string? client)
++    {
++        if (profile is null || string.IsNullOrEmpty(client))
++        {
++            return 0;
++        }
++
++        if (!_unprobedClients.Any(c => client.Contains(c, StringComparison.OrdinalIgnoreCase)))
++        {
++            return 0;
++        }
++
++        var kept = new List<DirectPlayProfile>(profile.DirectPlayProfiles.Length);
++        var changed = 0;
++
++        foreach (var directPlay in profile.DirectPlayProfiles)
++        {
++            // A null or empty AudioCodec means "any codec", which cannot be
++            // narrowed to "any except these" here. Those entries are left
++            // alone rather than guessed at; the Android TV profile always
++            // sends an explicit list.
++            if (string.IsNullOrEmpty(directPlay.AudioCodec))
++            {
++                kept.Add(directPlay);
++                continue;
++            }
++
++            var codecs = directPlay.AudioCodec.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
++            var allowed = codecs
++                .Where(c => !_unverifiedLosslessAudioCodecs.Contains(c, StringComparer.OrdinalIgnoreCase))
++                .ToArray();
++
++            if (allowed.Length == codecs.Length)
++            {
++                kept.Add(directPlay);
++                continue;
++            }
++
++            changed++;
++
++            // Every codec was stripped: the entry has to go. Setting AudioCodec
++            // to null would mean "any codec" and hand back exactly the claim
++            // being removed.
++            if (allowed.Length == 0)
++            {
++                continue;
++            }
++
++            directPlay.AudioCodec = string.Join(',', allowed);
++            kept.Add(directPlay);
++        }
++
++        if (changed > 0)
++        {
++            profile.DirectPlayProfiles = kept.ToArray();
++        }
++
++        return changed;
++    }
++}
+diff --git a/tests/Jellyfin.Api.Tests/Helpers/ClientAudioProfileSanitizerTests.cs b/tests/Jellyfin.Api.Tests/Helpers/ClientAudioProfileSanitizerTests.cs
+new file mode 100644
+index 0000000..380fa60
+--- /dev/null
++++ b/tests/Jellyfin.Api.Tests/Helpers/ClientAudioProfileSanitizerTests.cs
+@@ -0,0 +1,82 @@
++using Jellyfin.Api.Helpers;
++using MediaBrowser.Model.Dlna;
++using Xunit;
++
++namespace Jellyfin.Api.Tests.Helpers
++{
++    public static class ClientAudioProfileSanitizerTests
++    {
++        [Theory]
++        [InlineData("Android TV")]
++        [InlineData("AndroidTV")]
++        [InlineData("Jellyfin Android TV")]
++        [InlineData("Fire TV")]
++        public static void StripUnverifiedLosslessAudio_RemovesLosslessCodecs(string client)
++        {
++            var profile = ProfileWith("aac,ac3,eac3,dts,dca,mlp,truehd,flac,opus");
++
++            var changed = ClientAudioProfileSanitizer.StripUnverifiedLosslessAudio(profile, client);
++
++            Assert.Equal(1, changed);
++            Assert.Equal("aac,ac3,eac3,flac,opus", profile.DirectPlayProfiles[0].AudioCodec);
++        }
++
++        [Fact]
++        public static void StripUnverifiedLosslessAudio_DropsProfileWhenNothingSurvives()
++        {
++            var profile = ProfileWith("truehd,dts");
++
++            var changed = ClientAudioProfileSanitizer.StripUnverifiedLosslessAudio(profile, "Android TV");
++
++            Assert.Equal(1, changed);
++            // Emptying AudioCodec would mean "any codec" and hand the claim back.
++            Assert.Empty(profile.DirectPlayProfiles);
++        }
++
++        [Fact]
++        public static void StripUnverifiedLosslessAudio_LeavesOtherClientsAlone()
++        {
++            var profile = ProfileWith("aac,ac3,truehd");
++
++            var changed = ClientAudioProfileSanitizer.StripUnverifiedLosslessAudio(profile, "Jellyfin Web");
++
++            Assert.Equal(0, changed);
++            Assert.Equal("aac,ac3,truehd", profile.DirectPlayProfiles[0].AudioCodec);
++        }
++
++        [Fact]
++        public static void StripUnverifiedLosslessAudio_LeavesUnconstrainedEntriesAlone()
++        {
++            var profile = new DeviceProfile
++            {
++                DirectPlayProfiles = [new DirectPlayProfile { Container = "mkv", Type = DlnaProfileType.Video }]
++            };
++
++            var changed = ClientAudioProfileSanitizer.StripUnverifiedLosslessAudio(profile, "Android TV");
++
++            Assert.Equal(0, changed);
++            Assert.Single(profile.DirectPlayProfiles);
++        }
++
++        [Fact]
++        public static void StripUnverifiedLosslessAudio_HandlesNoProfile()
++        {
++            Assert.Equal(0, ClientAudioProfileSanitizer.StripUnverifiedLosslessAudio(null, "Android TV"));
++            Assert.Equal(0, ClientAudioProfileSanitizer.StripUnverifiedLosslessAudio(ProfileWith("truehd"), null));
++        }
++
++        private static DeviceProfile ProfileWith(string audioCodecs)
++            => new DeviceProfile
++            {
++                DirectPlayProfiles =
++                [
++                    new DirectPlayProfile
++                    {
++                        Container = "mkv",
++                        Type = DlnaProfileType.Video,
++                        AudioCodec = audioCodecs
++                    }
++                ]
++            };
++    }
++}
