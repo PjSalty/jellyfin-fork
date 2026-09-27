@@ -1,29 +1,34 @@
-From d9b87c8f658cbd50f5773f49301bdc97405aeb64 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Sat, 25 Jul 2026 23:21:17 -0500
-Subject: [PATCH 7/7] users: split the user query so sibling collections stop
+Subject: [PATCH 05/13] users: split the user query so sibling collections stop
  multiplying
 
-UserQuery uses AsSingleQuery over three SIBLING collections (Permissions,
-Preferences, AccessSchedules), so EF emits one query that JOINs them and returns
-their cartesian product. Each user carries ~24 permissions x ~13 preferences, so
-loading a single user materialises ~312 rows of duplicated user columns to build
-one User object, and loading all 11 users returned 3,432 rows.
+Intent: UserQuery used AsSingleQuery over three SIBLING collections
+(Permissions, Preferences, AccessSchedules), so EF emitted one query
+that JOINed them and returned their cartesian product: ~24 permissions
+x ~13 preferences made one user load ~312 rows, all 11 users 3,432.
+AsSplitQuery is the documented remedy for this shape. Measured on a
+live server: GetUserById 12.13ms -> 2.27ms per load (3 round trips
+included), GetUsers 3,432 rows / 70.2ms -> 418 rows / 4.36ms; the two
+statements were #1 and #2 by cumulative execution time because 5-19
+user loads fire per grid page request. Results are unchanged: the
+navigations are independent collections off one root. Carried
+unchanged onto 12.x, where UserQuery is also the tracked load behind
+RenameUser/UpdateUserAsync (split queries track and fix up the same
+way) and EF 10 embeds the root's full ordering in each split statement.
+Ceiling: the split statements are separate round trips outside a
+transaction, so a concurrent write between them can hand back a user
+row and collections from slightly different moments.
+Drop when: upstream switches UserQuery to a split query.
 
-AsSplitQuery is the documented remedy for this shape. Measured on a live server:
-  GetUserById  12.13ms -> 2.27ms per load (5.3x, 3 round trips included)
-  GetUsers     3,432 rows / 70.2ms -> 418 rows / 4.36ms (16x)
-
-These two statements were #1 and #2 in the database by cumulative execution time
-(24,722s of the top-8 total of 40,000s), because 5-19 user loads fire per grid
-page request. Split queries do not change results here: all four navigations are
-independent collections off the same root, loaded read-only (AsNoTracking).
+Patch: 0007
 ---
  .../Users/UserManager.cs                         | 16 +++++++++++++++-
  1 file changed, 15 insertions(+), 1 deletion(-)
 
 diff --git a/Jellyfin.Server.Implementations/Users/UserManager.cs b/Jellyfin.Server.Implementations/Users/UserManager.cs
-index 656a2b4..60588b5 100644
+index b15f6b9..f3d7c33 100644
 --- a/Jellyfin.Server.Implementations/Users/UserManager.cs
 +++ b/Jellyfin.Server.Implementations/Users/UserManager.cs
 @@ -134,8 +134,22 @@ namespace Jellyfin.Server.Implementations.Users
@@ -50,3 +55,6 @@ index 656a2b4..60588b5 100644
                              .Include(user => user.Permissions)
                              .Include(user => user.Preferences)
                              .Include(user => user.AccessSchedules)
+-- 
+2.55.0
+

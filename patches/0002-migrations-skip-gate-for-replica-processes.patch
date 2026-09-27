@@ -1,20 +1,36 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
-Date: Sat, 11 Jul 2026 08:18:32 -0500
-Subject: [PATCH 2/5] migrations: skip-gate for replica processes
+Date: Sat, 26 Sep 2026 19:08:40 -0500
+Subject: [PATCH 01/13] migrations: skip-gate for replica processes
 
 Intent: JELLYFIN_SKIP_MIGRATIONS=true turns migration execution into a
-checkpoint: zero pending (EF model + code migrations) means one info line
-and normal startup; any pending fails fast naming the count and pointing
-at the migration Job (--mode MigrateSystem). Replicas set the env, the
-Job does not.
+checkpoint: zero pending means one info line and normal startup; any
+pending fails fast naming the count and pointing at the migration Job
+(--mode MigrateSystem). Replicas set the env, the Job does not, so the
+Job's migrate path is untouched. "Pending" is read from the same
+sources the runner uses: the history table, the migrations assembly the
+active provider configures (an external provider such as the PostgreSQL
+plugin brings its own) and the code migrations of every stage, not only
+the stage being entered. Ported onto the 12.x MigrateStepAsync, which
+now returns whether anything was applied: a gated process applied
+nothing and returns false, so it never triggers the post-migration
+database optimisation on a replica boot. Includes the gate tests.
+Ceiling: the gate compares history with the migrations assembly, not
+the runtime model with the schema; a provider whose migrations lag the
+model passes it (EF does not check pending model changes for Jellyfin's
+explicit-target MigrateAsync either). bool.TryParse accepts only
+true/false.
 Drop when: upstream grows an equivalent gate.
+
+Patch: 0002
 ---
- .../Migrations/JellyfinMigrationService.cs    | 37 +++++++++++++++++++
- 1 file changed, 37 insertions(+)
+ .../Migrations/JellyfinMigrationService.cs    |  46 +++++
+ .../Migrations/SkipMigrationsGateTests.cs     | 177 ++++++++++++++++++
+ 2 files changed, 223 insertions(+)
+ create mode 100644 tests/Jellyfin.Server.Tests/Migrations/SkipMigrationsGateTests.cs
 
 diff --git a/Jellyfin.Server/Migrations/JellyfinMigrationService.cs b/Jellyfin.Server/Migrations/JellyfinMigrationService.cs
-index d664b71..0aeae1a 100644
+index a5b6bc4..b25e6f0 100644
 --- a/Jellyfin.Server/Migrations/JellyfinMigrationService.cs
 +++ b/Jellyfin.Server/Migrations/JellyfinMigrationService.cs
 @@ -28,12 +28,14 @@ namespace Jellyfin.Server.Migrations;
@@ -32,25 +48,27 @@ index d664b71..0aeae1a 100644
      private (string? LibraryDb, string? JellyfinDb, BackupManifestDto? FullBackup) _backupKey;
  
      /// <summary>
-@@ -185,6 +187,12 @@ internal class JellyfinMigrationService
- 
-     public async Task MigrateStepAsync(JellyfinMigrationStageTypes stage, IServiceProvider? serviceProvider)
+@@ -191,6 +193,14 @@ internal class JellyfinMigrationService
+     /// <returns>A value indicating whether at least one migration has been applied.</returns>
+     public async Task<bool> MigrateStepAsync(JellyfinMigrationStageTypes stage, IServiceProvider serviceProvider)
      {
 +        if (bool.TryParse(Environment.GetEnvironmentVariable(SkipMigrationsVariable), out var skipMigrations) && skipMigrations)
 +        {
++            // A gated process applies nothing, so it must not report that it did: true would run the
++            // post-migration database optimisation on every replica boot.
 +            await EnsureNoPendingMigrationsAsync().ConfigureAwait(false);
-+            return;
++            return false;
 +        }
 +
          var logger = _startupLogger.With(_loggerFactory.CreateLogger<JellyfinMigrationService>()).BeginGroup($"Migrate stage {stage}.");
          ICollection<CodeMigration> migrationStage = (Migrations.FirstOrDefault(e => e.Stage == stage) as ICollection<CodeMigration>) ?? [];
  
-@@ -279,6 +287,35 @@ internal class JellyfinMigrationService
+@@ -313,6 +323,42 @@ internal class JellyfinMigrationService
          return Assembly.GetEntryAssembly()!.GetName().Version!.ToString();
      }
  
 +    // Multi instance gate: replicas set JELLYFIN_SKIP_MIGRATIONS and rely on a dedicated
-+    // process (--mode MigrateSystem) to apply migrations before they are started.
++    // process (--mode MigrateSystem, which does not set it) to apply migrations before they are started.
 +    private async Task EnsureNoPendingMigrationsAsync()
 +    {
 +        if (_skipGatePassed)
@@ -61,8 +79,15 @@ index d664b71..0aeae1a 100644
 +        var dbContext = await _dbContextFactory.CreateDbContextAsync().ConfigureAwait(false);
 +        await using (dbContext.ConfigureAwait(false))
 +        {
-+            var appliedMigrations = (await dbContext.Database.GetAppliedMigrationsAsync().ConfigureAwait(false)).ToHashSet();
-+            var pendingCount = (await dbContext.Database.GetPendingMigrationsAsync().ConfigureAwait(false)).Count()
++            // Read what MigrateStepAsync would run: the history table, the migrations assembly the active
++            // provider configures (an external provider such as the PostgreSQL plugin ships its own), and
++            // the code migrations of every stage, not only the one being entered.
++            var historyRepository = dbContext.GetService<IHistoryRepository>();
++            var migrationsAssembly = dbContext.GetService<IMigrationsAssembly>();
++            var appliedMigrations = (await historyRepository.GetAppliedMigrationsAsync().ConfigureAwait(false))
++                .Select(e => e.MigrationId)
++                .ToHashSet(StringComparer.Ordinal);
++            var pendingCount = migrationsAssembly.Migrations.Keys.Count(e => !appliedMigrations.Contains(e))
 +                + Migrations.SelectMany(e => e).Count(e => !appliedMigrations.Contains(e.BuildCodeMigrationId()));
 +            if (pendingCount > 0)
 +            {
@@ -81,6 +106,189 @@ index d664b71..0aeae1a 100644
      public async Task CleanupSystemAfterMigration(ILogger logger)
      {
          if (_backupKey != default)
+diff --git a/tests/Jellyfin.Server.Tests/Migrations/SkipMigrationsGateTests.cs b/tests/Jellyfin.Server.Tests/Migrations/SkipMigrationsGateTests.cs
+new file mode 100644
+index 0000000..3f9d0e2
+--- /dev/null
++++ b/tests/Jellyfin.Server.Tests/Migrations/SkipMigrationsGateTests.cs
+@@ -0,0 +1,177 @@
++using System;
++using System.Collections.Generic;
++using System.Linq;
++using System.Reflection;
++using System.Threading;
++using System.Threading.Tasks;
++using Jellyfin.Database.Implementations;
++using Jellyfin.Database.Implementations.Locking;
++using Jellyfin.Database.Providers.Sqlite;
++using Jellyfin.Server.Migrations;
++using Jellyfin.Server.Migrations.Stages;
++using Jellyfin.Server.ServerSetupApp;
++using MediaBrowser.Common.Configuration;
++using Microsoft.Data.Sqlite;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.EntityFrameworkCore.Infrastructure;
++using Microsoft.EntityFrameworkCore.Migrations;
++using Microsoft.Extensions.DependencyInjection;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.Server.Tests.Migrations;
++
++/// <summary>
++/// Covers the JELLYFIN_SKIP_MIGRATIONS gate. The migrations assembly is this test assembly, standing in for an
++/// external database provider that ships its own migrations the way the PostgreSQL plugin does.
++/// </summary>
++public sealed class SkipMigrationsGateTests : IDisposable
++{
++    private const string SkipMigrationsVariable = "JELLYFIN_SKIP_MIGRATIONS";
++
++    private readonly string? _previousValue;
++    private readonly SqliteConnection _connection;
++    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
++
++    public SkipMigrationsGateTests()
++    {
++        // The variable and the gate's pass flag are process-wide; tests in one class never run in parallel.
++        _previousValue = Environment.GetEnvironmentVariable(SkipMigrationsVariable);
++        ResetGate();
++
++        _connection = new SqliteConnection("Data Source=:memory:");
++        _connection.Open();
++
++        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
++            .UseSqlite(_connection, o => o.MigrationsAssembly(typeof(SkipGateProbeMigration).Assembly))
++            .Options;
++    }
++
++    private static CancellationToken Ct => TestContext.Current.CancellationToken;
++
++    public void Dispose()
++    {
++        Environment.SetEnvironmentVariable(SkipMigrationsVariable, _previousValue);
++        ResetGate();
++        _connection.Dispose();
++    }
++
++    [Fact]
++    public async Task MigrateStep_GateSet_CountsTheProviderAssembly()
++    {
++        await StampCodeMigrationsAsync(null);
++        Environment.SetEnvironmentVariable(SkipMigrationsVariable, "true");
++
++        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
++            () => CreateService().MigrateStepAsync(JellyfinMigrationStageTypes.PreInitialisation, EmptyServices()));
++
++        // The one pending migration only exists in the configured migrations assembly.
++        Assert.Contains($"{SkipMigrationsVariable} is set but there are 1 pending migrations", ex.Message, StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public async Task MigrateStep_GateSet_CountsCodeMigrationsOfEveryStage()
++    {
++        var laterStage = AllCodeMigrations().First(e => e.Metadata.Stage == JellyfinMigrationStageTypes.AppInitialisation);
++        await ApplyProbeMigrationAsync();
++        await StampCodeMigrationsAsync(laterStage.BuildCodeMigrationId());
++        Environment.SetEnvironmentVariable(SkipMigrationsVariable, "true");
++
++        var ex = await Assert.ThrowsAsync<InvalidOperationException>(
++            () => CreateService().MigrateStepAsync(JellyfinMigrationStageTypes.PreInitialisation, EmptyServices()));
++
++        Assert.Contains("there are 1 pending migrations", ex.Message, StringComparison.Ordinal);
++    }
++
++    [Fact]
++    public async Task MigrateStep_GateSetAndNothingPending_ReturnsFalse()
++    {
++        await ApplyProbeMigrationAsync();
++        await StampCodeMigrationsAsync(null);
++        Environment.SetEnvironmentVariable(SkipMigrationsVariable, "true");
++
++        var service = CreateService();
++        foreach (var stage in Enum.GetValues<JellyfinMigrationStageTypes>())
++        {
++            // False keeps a gated replica from running the post-migration database optimisation.
++            Assert.False(await service.MigrateStepAsync(stage, EmptyServices()));
++        }
++    }
++
++    [Fact]
++    public async Task MigrateStep_GateUnset_RunsThePendingMigration()
++    {
++        await StampCodeMigrationsAsync(null);
++        Environment.SetEnvironmentVariable(SkipMigrationsVariable, null);
++
++        // The migration Job runs without the variable: the runner must still apply what is pending.
++        Assert.True(await CreateService().MigrateStepAsync(JellyfinMigrationStageTypes.CoreInitialisation, EmptyServices()));
++
++        using var context = CreateDbContext();
++        Assert.Contains(SkipGateProbeMigration.Id, await context.Database.GetAppliedMigrationsAsync(Ct));
++    }
++
++    private static void ResetGate()
++        => typeof(JellyfinMigrationService)
++            .GetField("_skipGatePassed", BindingFlags.NonPublic | BindingFlags.Static)!
++            .SetValue(null, false);
++
++    private static IServiceProvider EmptyServices() => new ServiceCollection().BuildServiceProvider();
++
++    private static IEnumerable<CodeMigration> AllCodeMigrations()
++        => typeof(JellyfinMigrationService).Assembly.GetTypes()
++            .Select(e => (Type: e, Metadata: e.GetCustomAttribute<JellyfinMigrationAttribute>()))
++            .Where(e => e.Metadata is not null && !e.Type.IsAbstract)
++            .Select(e => new CodeMigration(e.Type, e.Metadata!, null));
++
++    private async Task ApplyProbeMigrationAsync()
++    {
++        using var context = CreateDbContext();
++        await context.GetService<IMigrator>().MigrateAsync(SkipGateProbeMigration.Id, Ct);
++    }
++
++    private async Task StampCodeMigrationsAsync(string? except)
++    {
++        using var context = CreateDbContext();
++        var historyRepository = context.GetService<IHistoryRepository>();
++        await historyRepository.CreateIfNotExistsAsync(Ct);
++        foreach (var id in AllCodeMigrations().Select(e => e.BuildCodeMigrationId()).Where(e => e != except))
++        {
++            await context.Database.ExecuteSqlRawAsync(historyRepository.GetInsertScript(new HistoryRow(id, "test")), Ct);
++        }
++    }
++
++    private JellyfinDbContext CreateDbContext() => new(
++        _dbOptions,
++        NullLogger<JellyfinDbContext>.Instance,
++        new SqliteDatabaseProvider(Mock.Of<IApplicationPaths>(), NullLogger<SqliteDatabaseProvider>.Instance),
++        new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
++
++    private JellyfinMigrationService CreateService()
++    {
++        var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
++        factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
++        factory.Setup(f => f.CreateDbContextAsync(It.IsAny<CancellationToken>())).ReturnsAsync(CreateDbContext);
++
++        return new JellyfinMigrationService(
++            factory.Object,
++            NullLoggerFactory.Instance,
++            new StartupLogger<JellyfinMigrationService>(NullLogger<JellyfinMigrationService>.Instance),
++            Mock.Of<IApplicationPaths>());
++    }
++
++    /// <summary>
++    /// The only migration in this test assembly, playing the part of a provider plugin's own migration.
++    /// </summary>
++    [DbContext(typeof(JellyfinDbContext))]
++    [Migration(Id)]
++    private sealed class SkipGateProbeMigration : Migration
++    {
++        public const string Id = "20990101000000_SkipGateProbe";
++
++        protected override void Up(MigrationBuilder migrationBuilder)
++        {
++        }
++    }
++}
 -- 
 2.55.0
 

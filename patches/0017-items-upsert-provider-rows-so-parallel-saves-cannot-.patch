@@ -1,176 +1,223 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
-Date: Tue, 1 Sep 2026 08:42:40 -0500
-Subject: [PATCH] items: upsert provider rows so parallel saves cannot race the
- key
+Date: Sat, 26 Sep 2026 19:19:05 -0500
+Subject: [PATCH 09/13] items: upsert provider rows so parallel saves cannot
+ race the key
 
 Intent: for an existing item, UpdateOrInsertItems deletes the
 BaseItemProviders rows and re-inserts them through the re-attached
-change tracker (the provider entities carry no ItemId of their own, so
-Attach marks them Added). Two parallel refresh tasks saving the same
-item both run the DELETE, neither DELETE sees the other's uncommitted
-re-inserts under READ COMMITTED, and the losing transaction aborts on
+change tracker. Two parallel refresh tasks saving the same item both run
+the DELETE, neither DELETE sees the other's uncommitted re-inserts under
+READ COMMITTED, and the losing transaction aborts on
 PK_BaseItemProviders (observed four times in one library-scan window).
-Detach the providers from the tracked graph and write them with
-ON CONFLICT DO UPDATE so concurrent savers converge on the last
-committed value; iterating in ordinal ProviderId order makes every
-transaction take its row locks in the same sequence, closing the 40P01
-deadlock window a per-transaction ordering would leave. Same treatment
-as the ItemValues get-or-create in 0003; new-item inserts are untouched
-(a race there hits PK_BaseItems first, a different failure). The
-sibling delete-then-reinsert paths (BaseItemImageInfos,
-BaseItemMetadataFields) stay on the change tracker: their rows carry
-fresh per-row Guids, so the same race duplicates rows rather than
-aborting, a residual documented in DIVERGENCE.md. Includes the
-schema-backed table test.
+Keep the provider rows off the tracked graph and write them with
+INSERT ... ON CONFLICT ("ItemId", "ProviderId") DO UPDATE so concurrent
+savers converge. Ported to ItemPersistenceService: 12.x replaced the
+per-item delete with one batched delete per owned table right before
+SaveChanges, so the upsert now runs AFTER that delete (in its old spot
+the delete would erase every upserted row; the upstream
+ItemPersistenceOwnedRowTests catch that placement) and is ordered by
+(ItemId, ProviderId) across the whole batch, so every transaction takes
+the row locks in one sequence. New-item inserts stay on the tracker (a
+race there hits PK_BaseItems first, a different failure). Includes the
+schema tests and a save-path test that injects the competing row
+between the delete and the insert (fails on stock 12.1 with the
+primary-key violation).
+Ceiling: when both savers' deletes run before either commits, the final
+set is the union of both savers' provider keys (last committer's
+values on overlap) until the next uncontended save. The sibling
+BaseItemImageInfos/BaseItemMetadataFields rows stay on
+delete-then-reinsert; their per-row Guids cannot collide, so the same
+race can duplicate rows there. One statement per provider row
+(shortcut: marker in the code).
 Drop when: upstream serialises or upserts provider writes (same
 ItemPersistenceService refactor line as 0003).
+
+Patch: 0017
 ---
- .../Item/BaseItemRepository.cs                |  27 +++++
- .../Item/BaseItemProviderUpsertTests.cs       | 110 ++++++++++++++++++
- 2 files changed, 137 insertions(+)
+ .../Item/ItemPersistenceService.cs            |  29 +++
+ .../Item/BaseItemProviderUpsertTests.cs       | 190 ++++++++++++++++++
+ 2 files changed, 219 insertions(+)
  create mode 100644 tests/Jellyfin.Server.Implementations.Tests/Item/BaseItemProviderUpsertTests.cs
 
-diff --git a/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs b/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
-index bf1fa9c..15d9eff 100644
---- a/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
-+++ b/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
-@@ -730,6 +730,33 @@ public sealed class BaseItemRepository
+diff --git a/Jellyfin.Server.Implementations/Item/ItemPersistenceService.cs b/Jellyfin.Server.Implementations/Item/ItemPersistenceService.cs
+index 298b534..8ff698a 100644
+--- a/Jellyfin.Server.Implementations/Item/ItemPersistenceService.cs
++++ b/Jellyfin.Server.Implementations/Item/ItemPersistenceService.cs
+@@ -278,6 +278,7 @@ public class ItemPersistenceService : IItemPersistenceService
+ 
+         var ids = tuples.Select(f => f.Item.Id).ToArray();
+         var existingItems = context.BaseItems.WhereOneOrMany(ids, e => e.Id).Select(f => f.Id).ToHashSet();
++        var providerRows = new List<(Guid ItemId, string ProviderId, string ProviderValue)>();
+ 
+         foreach (var item in tuples)
+         {
+@@ -300,6 +301,14 @@ public class ItemPersistenceService : IItemPersistenceService
                      context.BaseItemMetadataFields.AddRange(entity.LockedFields);
                  }
  
-+                // Parallel refresh tasks can save the same item concurrently: each one
-+                // runs the provider ExecuteDelete above, neither DELETE sees the other's
-+                // uncommitted re-inserts, and the losing transaction then aborts on the
-+                // (ItemId, ProviderId) primary key (observed four times in one library
-+                // scan window on PostgreSQL). Detach the providers from the tracked graph
-+                // and write them with a conflict-tolerant upsert instead so concurrent
-+                // savers converge on the last committed value. Ordinal ProviderId order
-+                // makes every transaction take the row locks in the same sequence, so two
-+                // concurrent savers cannot deadlock each other (40P01). Same approach as
-+                // the ItemValues get-or-create; SQLite has supported ON CONFLICT since 3.24.
-+                // shortcut: one statement per provider row (a handful per item); batch
-+                // into a single multi-row INSERT if that ever grows.
-+                var providers = entity.Provider;
-+                entity.Provider = null;
-+                if (providers is not null)
++                // Keep the provider rows off the tracked graph: they are upserted after the batched
++                // owned-row delete below (see there for why).
++                if (entity.Provider is not null)
 +                {
-+                    foreach (var provider in providers.OrderBy(p => p.ProviderId, StringComparer.Ordinal))
-+                    {
-+                        context.Database.ExecuteSql(
-+                            $"""
-+                            INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
-+                            VALUES ({entity.Id}, {provider.ProviderId}, {provider.ProviderValue})
-+                            ON CONFLICT ("ItemId", "ProviderId") DO UPDATE SET "ProviderValue" = excluded."ProviderValue"
-+                            """);
-+                    }
++                    providerRows.AddRange(entity.Provider.Select(p => (entity.Id, p.ProviderId, p.ProviderValue)));
++                    entity.Provider = null;
 +                }
 +
                  context.BaseItems.Attach(entity).State = EntityState.Modified;
              }
          }
+@@ -448,6 +457,26 @@ public class ItemPersistenceService : IItemPersistenceService
+             context.BaseItemProviders.WhereOneOrMany(updatedIds, e => e.ItemId).ExecuteDelete();
+             context.BaseItemImageInfos.WhereOneOrMany(updatedIds, e => e.ItemId).ExecuteDelete();
+             context.BaseItemMetadataFields.WhereOneOrMany(updatedIds, e => e.ItemId).ExecuteDelete();
++
++            // Parallel refresh tasks can save the same item concurrently: each runs the delete
++            // above, neither DELETE sees the other's uncommitted re-inserts, and a plain re-insert
++            // aborts the losing transaction on the (ItemId, ProviderId) primary key (observed four
++            // times in one library scan window on PostgreSQL). Upsert instead so concurrent savers
++            // converge on the last committed value. This has to run after the delete, which would
++            // otherwise erase it. Ordinal (ItemId, ProviderId) order makes every transaction take
++            // the row locks in one sequence across the whole batch, so two savers cannot deadlock
++            // each other. SQLite supports ON CONFLICT since 3.24.
++            // shortcut: one statement per provider row (a handful per item); batch into a
++            // multi-row INSERT if that ever shows up in the statement statistics.
++            foreach (var row in providerRows.OrderBy(r => r.ItemId).ThenBy(r => r.ProviderId, StringComparer.Ordinal))
++            {
++                context.Database.ExecuteSql(
++                    $"""
++                    INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
++                    VALUES ({row.ItemId}, {row.ProviderId}, {row.ProviderValue})
++                    ON CONFLICT ("ItemId", "ProviderId") DO UPDATE SET "ProviderValue" = excluded."ProviderValue"
++                    """);
++            }
+         }
+ 
+         context.SaveChanges();
 diff --git a/tests/Jellyfin.Server.Implementations.Tests/Item/BaseItemProviderUpsertTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Item/BaseItemProviderUpsertTests.cs
 new file mode 100644
-index 0000000..a1bde8a
+index 0000000..3516dca
 --- /dev/null
 +++ b/tests/Jellyfin.Server.Implementations.Tests/Item/BaseItemProviderUpsertTests.cs
-@@ -0,0 +1,110 @@
+@@ -0,0 +1,190 @@
 +using System;
++using System.Collections.Generic;
 +using System.Data.Common;
 +using System.Linq;
++using System.Threading;
 +using Jellyfin.Database.Implementations;
 +using Jellyfin.Database.Implementations.Entities;
-+using Jellyfin.Database.Implementations.Locking;
-+using Jellyfin.Database.Providers.Sqlite;
-+using Microsoft.Data.Sqlite;
++using Jellyfin.Server.Implementations.Item;
++using MediaBrowser.Controller;
++using MediaBrowser.Controller.Configuration;
++using MediaBrowser.Controller.Entities;
++using MediaBrowser.Controller.Library;
++using MediaBrowser.Model.Configuration;
 +using Microsoft.EntityFrameworkCore;
++using Microsoft.EntityFrameworkCore.Diagnostics;
 +using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
 +using Xunit;
 +
 +namespace Jellyfin.Server.Implementations.Tests.Item;
 +
 +/// <summary>
-+/// Covers the conflict-tolerant BaseItemProviders upsert used by
-+/// <c>BaseItemRepository.UpdateOrInsertItems</c>. The parallel-save race itself cannot be
-+/// reproduced on the in-memory SQLite test harness (SQLite serialises writes, which is
-+/// exactly why the bug does not occur there), but these tests verify the facts the fix
-+/// relies on against the real generated schema: the composite primary key is enforced,
-+/// and the ON CONFLICT DO UPDATE the fix emits is portable to SQLite, keeps a single
-+/// row, and overwrites it with the newest value.
++/// Covers the conflict-tolerant BaseItemProviders upsert in <c>ItemPersistenceService.UpdateOrInsertItems</c>.
++/// SQLite serialises writers, so the cross-transaction race cannot happen here; the facts below pin the schema the
++/// fix relies on (the composite primary key, and the exact upsert keeps one row with the newest value) and the save
++/// path's handling of a provider row that reappears between its delete and its insert. Placement after the batched
++/// owned-row delete is guarded by <see cref="ItemPersistenceOwnedRowTests"/>.
 +/// </summary>
-+public sealed class BaseItemProviderUpsertTests : IDisposable
++public sealed class BaseItemProviderUpsertTests : SqliteDbTestFixture
 +{
 +    private const string ProviderId = "Imdb";
 +
-+    private readonly SqliteConnection _connection;
-+    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
-+    private readonly Guid _itemId;
++    private readonly RaceInjector _race;
++    private readonly Guid _itemId = Guid.NewGuid();
++    private readonly ILibraryManager? _previousLibraryManager;
++    private readonly IServerConfigurationManager? _previousConfigurationManager;
 +
 +    public BaseItemProviderUpsertTests()
++        : this(new RaceInjector())
 +    {
-+        _connection = new SqliteConnection("Data Source=:memory:");
-+        _connection.Open();
-+
-+        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
-+            .UseSqlite(_connection)
-+            .Options;
-+
-+        using var context = CreateDbContext();
-+        context.Database.EnsureCreated();
-+
-+        // Provider rows carry a foreign key to BaseItems, so seed the parent item.
-+        _itemId = Guid.NewGuid();
-+        context.BaseItems.Add(new BaseItemEntity
-+        {
-+            Id = _itemId,
-+            Type = "MediaBrowser.Controller.Entities.Movies.Movie"
-+        });
-+        context.SaveChanges();
 +    }
 +
-+    public void Dispose()
++    private BaseItemProviderUpsertTests(RaceInjector race)
++        : base(race)
 +    {
-+        _connection.Dispose();
++        _race = race;
++        _race.CreateDbContext = CreateDbContext;
++
++        // BaseItem resolves these through process-wide statics; restored in Dispose.
++        _previousLibraryManager = BaseItem.LibraryManager;
++        _previousConfigurationManager = BaseItem.ConfigurationManager;
++
++        var libraryManager = new Mock<ILibraryManager>();
++        libraryManager.Setup(l => l.GetCollectionFolders(It.IsAny<BaseItem>())).Returns([]);
++        BaseItem.LibraryManager = libraryManager.Object;
++
++        var configurationManager = new Mock<IServerConfigurationManager>();
++        configurationManager.Setup(c => c.Configuration).Returns(new ServerConfiguration());
++        BaseItem.ConfigurationManager = configurationManager.Object;
 +    }
 +
 +    [Fact]
 +    public void PlainInsert_DuplicateKey_ViolatesPrimaryKey()
 +    {
++        SeedItem();
 +        using var context = CreateDbContext();
 +
-+        InsertPlain(context, "tt0000001");
++        InsertPlain(context, _itemId, "tt0000001");
 +
-+        // Without conflict handling, two saves of the same item racing the
-+        // delete-then-reinsert of its provider rows violate the (ItemId, ProviderId)
-+        // primary key; the losing library-scan transaction aborts.
-+        Assert.ThrowsAny<DbException>(() => InsertPlain(context, "tt0000002"));
++        // Without conflict handling, two saves of one item racing the delete-then-reinsert of its provider rows
++        // violate the (ItemId, ProviderId) primary key and the losing transaction aborts.
++        Assert.ThrowsAny<DbException>(() => InsertPlain(context, _itemId, "tt0000002"));
 +    }
 +
 +    [Fact]
 +    public void Upsert_DuplicateKey_KeepsOneRowWithNewestValue()
 +    {
++        SeedItem();
 +        using var context = CreateDbContext();
 +
 +        Upsert(context, "tt0000001");
 +        Upsert(context, "tt0000002");
 +
-+        // Guid's == operator is on the banned-API list for this project; Equals is the sanctioned spelling.
-+        var rows = context.BaseItemProviders
-+            .Where(e => e.ItemId.Equals(_itemId))
-+            .ToList();
-+        var row = Assert.Single(rows);
++        var row = Assert.Single(context.BaseItemProviders.Where(e => e.ItemId.Equals(_itemId)));
 +        Assert.Equal("tt0000002", row.ProviderValue);
 +    }
 +
-+    private void InsertPlain(JellyfinDbContext context, string value)
++    [Fact]
++    public void SaveItems_ProviderRowWrittenConcurrently_KeepsOneRowWithThisSavesValue()
++    {
++        var service = CreateService();
++        service.SaveItems([CreateBook(new() { [ProviderId] = "tt0000001" })], CancellationToken.None);
++
++        _race.Arm(_itemId, ProviderId, "tt-concurrent");
++        service.SaveItems([CreateBook(new() { [ProviderId] = "tt0000002" })], CancellationToken.None);
++
++        Assert.Equal(1, _race.Fired);
++        using var context = CreateDbContext();
++        var row = Assert.Single(context.BaseItemProviders.Where(e => e.ItemId.Equals(_itemId)));
++        Assert.Equal("tt0000002", row.ProviderValue);
++    }
++
++    protected override void Dispose(bool disposing)
++    {
++        BaseItem.LibraryManager = _previousLibraryManager!;
++        BaseItem.ConfigurationManager = _previousConfigurationManager!;
++        base.Dispose(disposing);
++    }
++
++    private static int InsertPlain(JellyfinDbContext context, Guid itemId, string value)
 +        => context.Database.ExecuteSql(
 +            $"""
 +            INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
-+            VALUES ({_itemId}, {ProviderId}, {value})
++            VALUES ({itemId}, {ProviderId}, {value})
 +            """);
 +
-+    // Mirrors the upsert in BaseItemRepository.UpdateOrInsertItems.
-+    private void Upsert(JellyfinDbContext context, string value)
++    // Same statement as ItemPersistenceService.UpdateOrInsertItems.
++    private int Upsert(JellyfinDbContext context, string value)
 +        => context.Database.ExecuteSql(
 +            $"""
 +            INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
@@ -178,12 +225,70 @@ index 0000000..a1bde8a
 +            ON CONFLICT ("ItemId", "ProviderId") DO UPDATE SET "ProviderValue" = excluded."ProviderValue"
 +            """);
 +
-+    private JellyfinDbContext CreateDbContext()
-+        => new JellyfinDbContext(
-+            _dbOptions,
-+            NullLogger<JellyfinDbContext>.Instance,
-+            new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
-+            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
++    private void SeedItem()
++    {
++        using var context = CreateDbContext();
++        context.BaseItems.Add(new BaseItemEntity { Id = _itemId, Type = "MediaBrowser.Controller.Entities.Movies.Movie" });
++        context.SaveChanges();
++    }
++
++    private Book CreateBook(Dictionary<string, string> providerIds) => new()
++    {
++        Id = _itemId,
++        Name = "Book",
++        ProviderIds = providerIds
++    };
++
++    private ItemPersistenceService CreateService() => new(
++        CreateDbContextFactory(),
++        new Mock<IServerApplicationHost>().Object,
++        NullLogger<ItemPersistenceService>.Instance);
++
++    /// <summary>
++    /// Plays the concurrent saver: right before the save path writes its first provider row, it commits (here:
++    /// writes inside the same transaction) a row with the same key that the save's delete could not see.
++    /// </summary>
++    private sealed class RaceInjector : DbCommandInterceptor
++    {
++        private (Guid ItemId, string ProviderId, string Value)? _row;
++
++        public Func<JellyfinDbContext>? CreateDbContext { get; set; }
++
++        public int Fired { get; private set; }
++
++        public void Arm(Guid itemId, string providerId, string value) => _row = (itemId, providerId, value);
++
++        public override InterceptionResult<int> NonQueryExecuting(DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
++        {
++            Inject(command);
++            return result;
++        }
++
++        public override InterceptionResult<DbDataReader> ReaderExecuting(DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
++        {
++            Inject(command);
++            return result;
++        }
++
++        private void Inject(DbCommand command)
++        {
++            if (_row is not { } row
++                || Fired > 0
++                || !command.CommandText.Contains("INSERT INTO \"BaseItemProviders\"", StringComparison.Ordinal))
++            {
++                return;
++            }
++
++            Fired++;
++            using var context = CreateDbContext!();
++            context.Database.UseTransaction(command.Transaction);
++            context.Database.ExecuteSql(
++                $"""
++                INSERT INTO "BaseItemProviders" ("ItemId", "ProviderId", "ProviderValue")
++                VALUES ({row.ItemId}, {row.ProviderId}, {row.Value})
++                """);
++        }
++    }
 +}
 -- 
 2.55.0

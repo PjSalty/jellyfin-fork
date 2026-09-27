@@ -1,124 +1,151 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
-Date: Sat, 11 Jul 2026 08:18:32 -0500
-Subject: [PATCH 3/5] items: make the ItemValues get-or-create concurrency-safe
+Date: Sat, 26 Sep 2026 19:11:39 -0500
+Subject: [PATCH 02/13] items: make the ItemValues get-or-create
+ concurrency-safe
 
-Intent: port of upstream PR 17119 to this tag (the logic lives in
-BaseItemRepository here; 12.0 extracted ItemPersistenceService): parallel
-item saves racing the same ItemValue no longer abort on duplicate keys.
-Includes the upstream-shaped table test.
-Drop when: UPSTREAM_REF contains PR 17119.
+Intent: port of upstream PR 17119's goal to ItemPersistenceService
+(12.x moved UpdateOrInsertItems out of BaseItemRepository): parallel
+item saves that introduce the same new genre/studio/tag no longer abort
+on the unique (Type, Value) index. Missing values are written with
+INSERT ... ON CONFLICT ("Type", "Value") DO NOTHING in ordinal
+(Type, Value) order, so concurrent transactions wait on the index in
+one sequence, and the canonical rows are re-read before ItemValuesMap
+is built, so a value created by another saver maps onto the stored row
+instead of a locally generated id. Valid SQLite (3.24+) and PostgreSQL.
+Includes the schema tests and a save-path test that injects the
+competing row mid-save (fails on stock 12.1 with the unique-index
+DbUpdateException).
+Ceiling: SQLite serialises writers, so the tests prove the statement and
+the re-read, not the cross-transaction wait. The re-read assumes READ
+COMMITTED (the PostgreSQL default). With a second-level query cache in
+front of the database, ItemValues must be invalidated by the raw INSERT
+or excluded from caching. The same-item ItemValuesMap race stays open.
+Drop when: UPSTREAM_REF contains PR 17119 (its catch-and-retry shape
+changes the failure mode rather than being a no-op swap).
+
+Patch: 0003
 ---
- .../Item/BaseItemRepository.cs                | 30 +++++-
- .../Item/ItemValueUpsertTests.cs              | 91 +++++++++++++++++++
- 2 files changed, 117 insertions(+), 4 deletions(-)
+ .../Item/ItemPersistenceService.cs            |  32 +++-
+ .../Item/ItemValueUpsertTests.cs              | 160 ++++++++++++++++++
+ 2 files changed, 187 insertions(+), 5 deletions(-)
  create mode 100644 tests/Jellyfin.Server.Implementations.Tests/Item/ItemValueUpsertTests.cs
 
-diff --git a/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs b/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
-index 676c194..0032e6f 100644
---- a/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
-+++ b/Jellyfin.Server.Implementations/Item/BaseItemRepository.cs
-@@ -681,7 +681,7 @@ public sealed class BaseItemRepository
-             .SelectMany(f => f.Values)
-             .Distinct()
-             .ToArray();
+diff --git a/Jellyfin.Server.Implementations/Item/ItemPersistenceService.cs b/Jellyfin.Server.Implementations/Item/ItemPersistenceService.cs
+index a7b0b1c..298b534 100644
+--- a/Jellyfin.Server.Implementations/Item/ItemPersistenceService.cs
++++ b/Jellyfin.Server.Implementations/Item/ItemPersistenceService.cs
+@@ -316,11 +316,13 @@ public class ItemPersistenceService : IItemPersistenceService
+         var values = allListedItemValues.Select(e => e.Value).Distinct().ToArray();
+         var allListedItemValuesSet = allListedItemValues.ToHashSet();
+ 
 -        var existingValues = context.ItemValues
 +        ItemValue[] StoredItemValues() => context.ItemValues
-             .Select(e => new
-             {
-                 item = e,
-@@ -690,6 +690,8 @@ public sealed class BaseItemRepository
-             .Where(f => allListedItemValues.Select(e => $"{(int)e.MagicNumber}+{e.Value}").Contains(f.Key))
-             .Select(e => e.item)
+             .Where(e => types.Contains(e.Type) && values.Contains(e.Value))
+             .AsEnumerable()
+             .Where(e => allListedItemValuesSet.Contains((e.Type, e.Value)))
              .ToArray();
 +
 +        var existingValues = StoredItemValues();
          var missingItemValues = allListedItemValues.Except(existingValues.Select(f => (MagicNumber: f.Type, f.Value))).Select(f => new ItemValue()
          {
-             CleanValue = GetCleanValue(f.Value),
-@@ -697,10 +699,30 @@ public sealed class BaseItemRepository
+             CleanValue = f.Value.GetCleanValue(),
+@@ -328,11 +330,31 @@ public class ItemPersistenceService : IItemPersistenceService
              Type = f.MagicNumber,
              Value = f.Value
          }).ToArray();
 -        context.ItemValues.AddRange(missingItemValues);
--        context.SaveChanges();
  
--        var itemValuesStore = existingValues.Concat(missingItemValues).ToArray();
-+        var itemValuesStore = existingValues;
+-        var itemValuesStore = existingValues
+-            .Concat(missingItemValues)
+-            .ToDictionary(e => (e.Type, e.Value));
++        var storedItemValues = existingValues;
 +        if (missingItemValues.Length > 0)
 +        {
-+            // ItemValues is a shared de-duplication table with a unique (Type, Value)
-+            // index. The library scanner saves items in parallel, so two items that
-+            // introduce the same new value (a shared genre, studio, tag, ...) can race to
-+            // create it; a plain INSERT lets the loser violate the constraint and abort
-+            // the transaction. Insert through a conflict-tolerant upsert (get-or-create)
-+            // rather than the change tracker so concurrent creators converge. Backends
-+            // that serialise writes never race, but the upsert is correct there too
-+            // (SQLite has supported ON CONFLICT since 3.24).
-+            foreach (var itemValue in missingItemValues)
++            // ItemValues is a shared de-duplication table with a unique (Type, Value) index. The library
++            // scanner saves items in parallel, so two saves that introduce the same new value (a shared
++            // genre, studio, tag, ...) race to create it, and a plain INSERT aborts the loser's whole
++            // transaction on the index. Write through a conflict-tolerant upsert (get-or-create) instead of
++            // the change tracker so concurrent creators converge; SQLite supports ON CONFLICT since 3.24.
++            // Ordinal (Type, Value) order makes every transaction wait on the index in one sequence: ON
++            // CONFLICT DO NOTHING blocks on a peer's uncommitted insert of the same key, and an unordered
++            // set would leave two savers a deadlock window.
++            foreach (var itemValue in missingItemValues.OrderBy(e => e.Type).ThenBy(e => e.Value, StringComparer.Ordinal))
 +            {
 +                context.Database.ExecuteSql(
 +                    $"""INSERT INTO "ItemValues" ("ItemValueId", "Type", "Value", "CleanValue") VALUES ({itemValue.ItemValueId}, {(int)itemValue.Type}, {itemValue.Value}, {itemValue.CleanValue}) ON CONFLICT ("Type", "Value") DO NOTHING""");
 +            }
 +
-+            // Re-read to resolve the canonical ids: a value we just upserted may have been
-+            // created concurrently under a different ItemValueId, so the map must point at
-+            // the row that actually exists rather than the id generated above.
-+            itemValuesStore = StoredItemValues();
++            // Re-read to resolve the canonical ids: a value upserted above may exist under the id a
++            // concurrent saver created, so the map must point at the stored row, never at the id generated
++            // here (that would leave ItemValuesMap rows pointing at nothing).
++            storedItemValues = StoredItemValues();
 +        }
 +
++        var itemValuesStore = storedItemValues.ToDictionary(e => (e.Type, e.Value));
          var valueMap = itemValueMaps
-             .Select(f => (f.Item, Values: f.Values.Select(e => itemValuesStore.First(g => g.Value == e.Value && g.Type == e.MagicNumber)).DistinctBy(e => e.ItemValueId).ToArray()))
+             .Select(f => (f.Item, Values: f.Values.Select(e => itemValuesStore[(e.MagicNumber, e.Value)]).DistinctBy(e => e.ItemValueId).ToArray()))
              .ToArray();
 diff --git a/tests/Jellyfin.Server.Implementations.Tests/Item/ItemValueUpsertTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Item/ItemValueUpsertTests.cs
 new file mode 100644
-index 0000000..14b18e2
+index 0000000..6da2c44
 --- /dev/null
 +++ b/tests/Jellyfin.Server.Implementations.Tests/Item/ItemValueUpsertTests.cs
-@@ -0,0 +1,91 @@
+@@ -0,0 +1,160 @@
 +using System;
 +using System.Data.Common;
 +using System.Linq;
++using System.Threading;
 +using Jellyfin.Database.Implementations;
 +using Jellyfin.Database.Implementations.Entities;
-+using Jellyfin.Database.Implementations.Locking;
-+using Jellyfin.Database.Providers.Sqlite;
-+using Microsoft.Data.Sqlite;
++using Jellyfin.Server.Implementations.Item;
++using MediaBrowser.Controller;
++using MediaBrowser.Controller.Configuration;
++using MediaBrowser.Controller.Entities;
++using MediaBrowser.Controller.Library;
++using MediaBrowser.Model.Configuration;
 +using Microsoft.EntityFrameworkCore;
++using Microsoft.EntityFrameworkCore.Diagnostics;
 +using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
 +using Xunit;
 +
 +namespace Jellyfin.Server.Implementations.Tests.Item;
 +
 +/// <summary>
-+/// Covers the conflict-tolerant ItemValues get-or-create used by
-+/// <c>BaseItemRepository.UpdateOrInsertItems</c>. The concurrency race itself cannot be
-+/// reproduced on the in-memory SQLite test harness (SQLite serialises writes, which is exactly
-+/// why the bug does not occur there), but these tests verify the two facts the fix relies on
-+/// against the real generated schema: the unique (Type, Value) index is enforced, and the
-+/// ON CONFLICT upsert the fix emits is portable to SQLite and idempotent.
++/// Covers the conflict-tolerant ItemValues get-or-create in <c>ItemPersistenceService.UpdateOrInsertItems</c>.
++/// SQLite serialises writers, so the cross-transaction race cannot happen here; the facts below pin the schema
++/// the fix relies on (the unique (Type, Value) index, and the exact upsert statement is valid and idempotent) and
++/// the save path's handling of a value that appears between its read and its insert.
 +/// </summary>
-+public sealed class ItemValueUpsertTests : IDisposable
++public sealed class ItemValueUpsertTests : SqliteDbTestFixture
 +{
-+    private readonly SqliteConnection _connection;
-+    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
++    private readonly RaceInjector _race;
++    private readonly ILibraryManager? _previousLibraryManager;
++    private readonly IServerConfigurationManager? _previousConfigurationManager;
 +
 +    public ItemValueUpsertTests()
++        : this(new RaceInjector())
 +    {
-+        _connection = new SqliteConnection("Data Source=:memory:");
-+        _connection.Open();
-+
-+        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
-+            .UseSqlite(_connection)
-+            .Options;
-+
-+        using var context = CreateDbContext();
-+        context.Database.EnsureCreated();
 +    }
 +
-+    public void Dispose()
++    private ItemValueUpsertTests(RaceInjector race)
++        : base(race)
 +    {
-+        _connection.Dispose();
++        _race = race;
++        _race.CreateDbContext = CreateDbContext;
++
++        // BaseItem resolves these through process-wide statics; restored in Dispose.
++        _previousLibraryManager = BaseItem.LibraryManager;
++        _previousConfigurationManager = BaseItem.ConfigurationManager;
++
++        var libraryManager = new Mock<ILibraryManager>();
++        libraryManager.Setup(l => l.GetCollectionFolders(It.IsAny<BaseItem>())).Returns([]);
++        BaseItem.LibraryManager = libraryManager.Object;
++
++        var configurationManager = new Mock<IServerConfigurationManager>();
++        configurationManager.Setup(c => c.Configuration).Returns(new ServerConfiguration());
++        BaseItem.ConfigurationManager = configurationManager.Object;
 +    }
 +
 +    [Fact]
@@ -128,9 +155,8 @@ index 0000000..14b18e2
 +
 +        InsertPlain(context, Guid.NewGuid(), ItemValueType.Genre, "Drama");
 +
-+        // Without conflict handling, a second item introducing the same (Type, Value)
-+        // violates IX_ItemValues_Type_Value. This is the failure reported in
-+        // JPVenson/Jellyfin.Pgsql#19 when two items race to create a shared value.
++        // Without conflict handling a second creator of the same (Type, Value) violates the unique index:
++        // the failure two parallel saves introducing the same new genre used to abort on.
 +        Assert.ThrowsAny<DbException>(() => InsertPlain(context, Guid.NewGuid(), ItemValueType.Genre, "Drama"));
 +    }
 +
@@ -142,30 +168,89 @@ index 0000000..14b18e2
 +        var inserted = Upsert(context, Guid.NewGuid(), ItemValueType.Genre, "Drama");
 +        var conflicted = Upsert(context, Guid.NewGuid(), ItemValueType.Genre, "Drama");
 +
-+        Assert.Equal(1, inserted);   // first writer creates the row
-+        Assert.Equal(0, conflicted); // second writer is a no-op, not a constraint violation
-+
-+        var rows = context.ItemValues
-+            .Where(e => e.Type == ItemValueType.Genre && e.Value == "Drama")
-+            .ToList();
-+        Assert.Single(rows);
++        Assert.Equal(1, inserted);
++        Assert.Equal(0, conflicted);
++        Assert.Single(context.ItemValues.Where(e => e.Type == ItemValueType.Genre && e.Value == "Drama"));
 +    }
 +
-+    private static void InsertPlain(JellyfinDbContext context, Guid id, ItemValueType type, string value)
++    [Fact]
++    public void SaveItems_ValueCreatedConcurrently_MapsOntoTheStoredRow()
++    {
++        var itemId = Guid.NewGuid();
++        var winnerId = Guid.NewGuid();
++        _race.Arm(winnerId, ItemValueType.Genre, "Drama");
++
++        CreateService().SaveItems([new Book { Id = itemId, Name = "Book", Genres = ["Drama"] }], CancellationToken.None);
++
++        Assert.Equal(1, _race.Fired);
++        using var context = CreateDbContext();
++        var stored = Assert.Single(context.ItemValues.Where(e => e.Type == ItemValueType.Genre && e.Value == "Drama"));
++        Assert.Equal(winnerId, stored.ItemValueId);
++        Assert.Equal(winnerId, Assert.Single(context.ItemValuesMap.Where(e => e.ItemId.Equals(itemId))).ItemValueId);
++    }
++
++    protected override void Dispose(bool disposing)
++    {
++        BaseItem.LibraryManager = _previousLibraryManager!;
++        BaseItem.ConfigurationManager = _previousConfigurationManager!;
++        base.Dispose(disposing);
++    }
++
++    private static int InsertPlain(JellyfinDbContext context, Guid id, ItemValueType type, string value)
 +        => context.Database.ExecuteSql(
 +            $"""INSERT INTO "ItemValues" ("ItemValueId", "Type", "Value", "CleanValue") VALUES ({id}, {(int)type}, {value}, {value})""");
 +
-+    // Mirrors the upsert in BaseItemRepository.UpdateOrInsertItems.
++    // Same statement as ItemPersistenceService.UpdateOrInsertItems.
 +    private static int Upsert(JellyfinDbContext context, Guid id, ItemValueType type, string value)
 +        => context.Database.ExecuteSql(
 +            $"""INSERT INTO "ItemValues" ("ItemValueId", "Type", "Value", "CleanValue") VALUES ({id}, {(int)type}, {value}, {value}) ON CONFLICT ("Type", "Value") DO NOTHING""");
 +
-+    private JellyfinDbContext CreateDbContext()
-+        => new JellyfinDbContext(
-+            _dbOptions,
-+            NullLogger<JellyfinDbContext>.Instance,
-+            new SqliteDatabaseProvider(null!, NullLogger<SqliteDatabaseProvider>.Instance),
-+            new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
++    private ItemPersistenceService CreateService() => new(
++        CreateDbContextFactory(),
++        new Mock<IServerApplicationHost>().Object,
++        NullLogger<ItemPersistenceService>.Instance);
++
++    /// <summary>
++    /// Plays the concurrent saver: right before the save path writes its first ItemValues row, it creates the
++    /// same (Type, Value) under another id inside the save's own transaction.
++    /// </summary>
++    private sealed class RaceInjector : DbCommandInterceptor
++    {
++        private (Guid Id, ItemValueType Type, string Value)? _winner;
++
++        public Func<JellyfinDbContext>? CreateDbContext { get; set; }
++
++        public int Fired { get; private set; }
++
++        public void Arm(Guid id, ItemValueType type, string value) => _winner = (id, type, value);
++
++        public override InterceptionResult<int> NonQueryExecuting(DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
++        {
++            Inject(command);
++            return result;
++        }
++
++        public override InterceptionResult<DbDataReader> ReaderExecuting(DbCommand command, CommandEventData eventData, InterceptionResult<DbDataReader> result)
++        {
++            Inject(command);
++            return result;
++        }
++
++        private void Inject(DbCommand command)
++        {
++            if (_winner is not { } winner
++                || Fired > 0
++                || !command.CommandText.Contains("INSERT INTO \"ItemValues\"", StringComparison.Ordinal))
++            {
++                return;
++            }
++
++            Fired++;
++            using var context = CreateDbContext!();
++            context.Database.UseTransaction(command.Transaction);
++            InsertPlain(context, winner.Id, winner.Type, winner.Value);
++        }
++    }
 +}
 -- 
 2.55.0

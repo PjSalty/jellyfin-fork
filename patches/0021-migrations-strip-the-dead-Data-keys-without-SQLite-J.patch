@@ -1,0 +1,360 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 19:27:06 -0500
+Subject: [PATCH 13/13] migrations: strip the dead Data keys without SQLite
+ JSON functions
+
+Intent: 12.1's StripEmbeddedLinkedChildren (a CoreInitialisation code
+migration every existing database runs) removed LinkedChildren,
+ExtraIds and SupportsExternalTransfer from BaseItems.Data with
+json_remove()/json_valid() through ExecuteSqlRaw. Those are SQLite
+functions: on PostgreSQL the statement fails with 42883 ("function
+json_valid(text) does not exist"), the migration service restores the
+pre-migration dump and the migration Job exits non-zero. Do the edit in
+provider-neutral C# instead: collect the ids whose Data mentions one of
+the keys, then per batch of 500 load Id + Data, drop the three
+top-level keys with System.Text.Json.Nodes and write changed rows back
+with ExecuteUpdate inside one transaction per batch. Every read is
+materialised before the writes that follow it (Npgsql allows one active
+command per connection). Blobs are re-serialized with JsonDefaults, the
+options they are written with, so kept content comes out byte for byte.
+A blob that is not valid JSON is left alone and counted in a warning
+(json_valid() skipped it too); one that is not a JSON object has no
+top-level keys to drop and is left alone. Includes a test that runs the
+old SQLite statement on a twin of every row and requires identical
+results on 1,007 rows across two batch boundaries (escapes, nested
+keys, key names inside values, malformed JSON, arrays, nulls), under an
+interceptor that refuses a write while a reader is open.
+Ceiling: one UPDATE per changed row (shortcut: marker in the code) and
+one round trip per batch of reads instead of a single statement; fine
+for a one-time migration.
+Unlike the old LIKE filter, matching is case-sensitive, which is exactly
+the set json_remove() could change.
+Drop when: upstream rewrites the routine without provider-specific SQL.
+
+Patch: 0021
+---
+ ...60911120000_StripEmbeddedLinkedChildren.cs | 103 ++++++++--
+ .../StripEmbeddedLinkedChildrenTests.cs       | 183 ++++++++++++++++++
+ 2 files changed, 274 insertions(+), 12 deletions(-)
+ create mode 100644 tests/Jellyfin.Server.Tests/Migrations/StripEmbeddedLinkedChildrenTests.cs
+
+diff --git a/Jellyfin.Server/Migrations/Routines/20260911120000_StripEmbeddedLinkedChildren.cs b/Jellyfin.Server/Migrations/Routines/20260911120000_StripEmbeddedLinkedChildren.cs
+index f61e423..d6a0065 100644
+--- a/Jellyfin.Server/Migrations/Routines/20260911120000_StripEmbeddedLinkedChildren.cs
++++ b/Jellyfin.Server/Migrations/Routines/20260911120000_StripEmbeddedLinkedChildren.cs
+@@ -1,4 +1,9 @@
++using System;
++using System.Linq;
++using System.Text.Json;
++using System.Text.Json.Nodes;
+ using Jellyfin.Database.Implementations;
++using Jellyfin.Extensions.Json;
+ using Microsoft.EntityFrameworkCore;
+ using Microsoft.Extensions.Logging;
+ 
+@@ -10,6 +15,10 @@ namespace Jellyfin.Server.Migrations.Routines;
+ [JellyfinMigration("2026-09-11T12:00:00", nameof(StripEmbeddedLinkedChildren))]
+ internal class StripEmbeddedLinkedChildren : IDatabaseMigrationRoutine
+ {
++    private const int BatchSize = 500;
++
++    private static readonly string[] _deadKeys = ["LinkedChildren", "ExtraIds", "SupportsExternalTransfer"];
++
+     private readonly ILogger<StripEmbeddedLinkedChildren> _logger;
+     private readonly IDbContextFactory<JellyfinDbContext> _dbProvider;
+ 
+@@ -26,19 +35,89 @@ internal class StripEmbeddedLinkedChildren : IDatabaseMigrationRoutine
+     {
+         using var context = _dbProvider.CreateDbContext();
+ 
+-        // json_valid guards the rare malformed blob: json_remove would abort the statement on it,
+-        // and one bad row must not cost every other row the fix.
+-        var updated = context.Database.ExecuteSqlRaw(
+-            """
+-            UPDATE "BaseItems"
+-            SET "Data" = json_remove("Data", '$.LinkedChildren', '$.ExtraIds', '$.SupportsExternalTransfer')
+-            WHERE "Data" IS NOT NULL
+-              AND json_valid("Data") = 1
+-              AND ("Data" LIKE '%"LinkedChildren"%'
+-                OR "Data" LIKE '%"ExtraIds"%'
+-                OR "Data" LIKE '%"SupportsExternalTransfer"%')
+-            """);
++        // The JSON is edited here rather than in SQL because the JSON functions are provider specific
++        // (json_remove/json_valid exist only in SQLite). Every read is materialised before the writes that
++        // follow it, since a provider without multiple active result sets (Npgsql) refuses a command while a
++        // reader on the same connection is open.
++        var candidateIds = context.BaseItems
++            .Where(e => e.Data != null
++                && (e.Data.Contains("\"LinkedChildren\"")
++                    || e.Data.Contains("\"ExtraIds\"")
++                    || e.Data.Contains("\"SupportsExternalTransfer\"")))
++            .Select(e => e.Id)
++            .ToList();
++
++        var updated = 0;
++        var malformed = 0;
++        foreach (var batch in candidateIds.Chunk(BatchSize))
++        {
++            var rows = context.BaseItems
++                .WhereOneOrMany(batch, e => e.Id)
++                .Select(e => new { e.Id, e.Data })
++                .ToList();
++
++            using var transaction = context.Database.BeginTransaction();
++            foreach (var row in rows)
++            {
++                var stripped = StripDeadKeys(row.Data, ref malformed);
++                if (stripped is null)
++                {
++                    continue;
++                }
++
++                // shortcut: one UPDATE per changed row (a one-time pass); fold a batch into a single
++                // UPDATE ... FROM (VALUES ...) if a large library ever makes this migration slow.
++                context.BaseItems
++                    .Where(e => e.Id.Equals(row.Id))
++                    .ExecuteUpdate(e => e.SetProperty(f => f.Data, stripped));
++                updated++;
++            }
++
++            transaction.Commit();
++        }
++
++        // A malformed blob is left as it is: one bad row must not cost every other row the fix.
++        if (malformed > 0)
++        {
++            _logger.LogWarning("Left {Count} items with unparsable serialized data untouched", malformed);
++        }
+ 
+         _logger.LogInformation("Dropped dead keys from the serialized data of {Count} items", updated);
+     }
++
++    /// <summary>
++    /// Removes the dead top-level keys. Re-serialized with the options the blob is written with, so everything
++    /// that is kept comes out as it went in.
++    /// </summary>
++    /// <param name="data">The serialized data.</param>
++    /// <param name="malformed">Incremented when the data is not valid JSON.</param>
++    /// <returns>The new data, or <c>null</c> when nothing has to change.</returns>
++    private static string? StripDeadKeys(string? data, ref int malformed)
++    {
++        if (data is null)
++        {
++            return null;
++        }
++
++        try
++        {
++            if (JsonNode.Parse(data) is not JsonObject json)
++            {
++                return null;
++            }
++
++            var removed = false;
++            foreach (var key in _deadKeys)
++            {
++                removed |= json.Remove(key);
++            }
++
++            return removed ? json.ToJsonString(JsonDefaults.Options) : null;
++        }
++        catch (Exception ex) when (ex is JsonException or ArgumentException)
++        {
++            malformed++;
++            return null;
++        }
++    }
+ }
+diff --git a/tests/Jellyfin.Server.Tests/Migrations/StripEmbeddedLinkedChildrenTests.cs b/tests/Jellyfin.Server.Tests/Migrations/StripEmbeddedLinkedChildrenTests.cs
+new file mode 100644
+index 0000000..6a20a1f
+--- /dev/null
++++ b/tests/Jellyfin.Server.Tests/Migrations/StripEmbeddedLinkedChildrenTests.cs
+@@ -0,0 +1,183 @@
++using System;
++using System.Collections.Generic;
++using System.Data.Common;
++using System.Linq;
++using System.Text.Json;
++using System.Threading;
++using Jellyfin.Database.Implementations;
++using Jellyfin.Database.Implementations.Entities;
++using Jellyfin.Database.Implementations.Locking;
++using Jellyfin.Database.Providers.Sqlite;
++using Jellyfin.Extensions.Json;
++using Jellyfin.Server.Migrations.Routines;
++using MediaBrowser.Common.Configuration;
++using Microsoft.Data.Sqlite;
++using Microsoft.EntityFrameworkCore;
++using Microsoft.EntityFrameworkCore.Diagnostics;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.Server.Tests.Migrations;
++
++/// <summary>
++/// The routine used SQLite's json_remove/json_valid, which PostgreSQL does not have. These tests hold the
++/// provider-neutral rewrite to the old statement's outcome on SQLite, row for row, and to the PostgreSQL rule
++/// that no command runs while a reader on the same connection is open.
++/// </summary>
++public sealed class StripEmbeddedLinkedChildrenTests : IDisposable
++{
++    private const string Name = "Café d'été <&> \"quoted\"";
++
++    // The statement this routine ran before the rewrite, limited to the rows that hold the expected outcome.
++    private const string SqliteStatement =
++        """
++        UPDATE "BaseItems"
++        SET "Data" = json_remove("Data", '$.LinkedChildren', '$.ExtraIds', '$.SupportsExternalTransfer')
++        WHERE "Data" IS NOT NULL
++          AND json_valid("Data") = 1
++          AND ("Data" LIKE '%"LinkedChildren"%'
++            OR "Data" LIKE '%"ExtraIds"%'
++            OR "Data" LIKE '%"SupportsExternalTransfer"%')
++          AND "Type" = 'Expected'
++        """;
++
++    private readonly SqliteConnection _connection;
++    private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
++
++    public StripEmbeddedLinkedChildrenTests()
++    {
++        _connection = new SqliteConnection("Data Source=:memory:");
++        _connection.Open();
++
++        _dbOptions = new DbContextOptionsBuilder<JellyfinDbContext>()
++            .UseSqlite(_connection)
++            .AddInterceptors(new SingleActiveCommandInterceptor())
++            .Options;
++
++        using var context = CreateDbContext();
++        context.Database.EnsureCreated();
++    }
++
++    public void Dispose()
++    {
++        _connection.Dispose();
++    }
++
++    [Fact]
++    public void Perform_MatchesTheSqliteStatementRowForRow()
++    {
++        var full = Serialize(new
++        {
++            Name,
++            LinkedChildren = new[] { new { Path = "/media/a.mkv", ItemId = Guid.NewGuid() } },
++            Tags = new[] { "x", "y" },
++            ExtraIds = new[] { Guid.NewGuid() },
++            SupportsExternalTransfer = true,
++            Nested = new { LinkedChildren = 1 },
++            Size = 1.5e30,
++            Count = 42
++        });
++        var stripped = Serialize(new
++        {
++            Name,
++            Tags = new[] { "x", "y" },
++            Nested = new { LinkedChildren = 1 },
++            Size = 1.5e30,
++            Count = 42
++        });
++
++        var blobs = new List<string?>
++        {
++            full,
++            Serialize(new { Name = "Only extras", ExtraIds = Array.Empty<Guid>() }),
++            Serialize(new { Name = "Value only", Overview = "\"LinkedChildren\" in a sentence" }),
++            "{\"LinkedChildren\": [1, 2,",
++            "[\"LinkedChildren\"]",
++            null
++        };
++
++        // Crosses the batch boundary twice.
++        for (var i = 0; i < 1001; i++)
++        {
++            blobs.Add(Serialize(new { Name = "Bulk " + i, LinkedChildren = new[] { i } }));
++        }
++
++        var pairs = blobs.Select(data => (Actual: AddItem("Actual", data), Expected: AddItem("Expected", data))).ToList();
++
++        using (var context = CreateDbContext())
++        {
++            context.Database.ExecuteSqlRaw(SqliteStatement);
++        }
++
++        CreateMigration().Perform();
++
++        using (var context = CreateDbContext())
++        {
++            var data = context.BaseItems.ToDictionary(e => e.Id, e => e.Data);
++            Assert.All(pairs, pair => Assert.Equal(data[pair.Expected], data[pair.Actual]));
++
++            // Everything that is kept comes out byte for byte as the serializer wrote it.
++            Assert.Equal(stripped, data[pairs[0].Actual]);
++        }
++    }
++
++    private static string Serialize<T>(T value) => JsonSerializer.Serialize(value, JsonDefaults.Options);
++
++    private Guid AddItem(string type, string? data)
++    {
++        using var context = CreateDbContext();
++        var id = Guid.NewGuid();
++        context.BaseItems.Add(new BaseItemEntity { Id = id, Type = type, Data = data });
++        context.SaveChanges();
++        return id;
++    }
++
++    private JellyfinDbContext CreateDbContext() => new(
++        _dbOptions,
++        NullLogger<JellyfinDbContext>.Instance,
++        new SqliteDatabaseProvider(Mock.Of<IApplicationPaths>(), NullLogger<SqliteDatabaseProvider>.Instance),
++        new NoLockBehavior(NullLogger<NoLockBehavior>.Instance));
++
++    private StripEmbeddedLinkedChildren CreateMigration()
++    {
++        var factory = new Mock<IDbContextFactory<JellyfinDbContext>>();
++        factory.Setup(f => f.CreateDbContext()).Returns(CreateDbContext);
++        factory.Setup(f => f.CreateDbContextAsync(It.IsAny<CancellationToken>())).ReturnsAsync(CreateDbContext);
++
++        return new StripEmbeddedLinkedChildren(NullLoggerFactory.Instance, factory.Object);
++    }
++
++    private sealed class SingleActiveCommandInterceptor : DbCommandInterceptor
++    {
++        private readonly HashSet<DbDataReader> _openReaders = [];
++
++        public override DbDataReader ReaderExecuted(DbCommand command, CommandExecutedEventData eventData, DbDataReader result)
++        {
++            _openReaders.Add(result);
++            return result;
++        }
++
++        public override InterceptionResult DataReaderClosing(DbCommand command, DataReaderClosingEventData eventData, InterceptionResult result)
++        {
++            _openReaders.Remove(eventData.DataReader);
++            return result;
++        }
++
++        public override InterceptionResult DataReaderDisposing(DbCommand command, DataReaderDisposingEventData eventData, InterceptionResult result)
++        {
++            _openReaders.Remove(eventData.DataReader);
++            return result;
++        }
++
++        public override InterceptionResult<int> NonQueryExecuting(DbCommand command, CommandEventData eventData, InterceptionResult<int> result)
++        {
++            if (_openReaders.Count > 0)
++            {
++                throw new InvalidOperationException("A command is already in progress: " + command.CommandText);
++            }
++
++            return result;
++        }
++    }
++}
+-- 
+2.55.0
+
