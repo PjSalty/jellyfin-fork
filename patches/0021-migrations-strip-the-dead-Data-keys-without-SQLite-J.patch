@@ -1,30 +1,30 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 19:27:06 -0500
-Subject: [PATCH 13/13] migrations: strip the dead Data keys without SQLite
+Subject: [PATCH 13/15] migrations: strip the dead Data keys without SQLite
  JSON functions
 
 Intent: 12.1's StripEmbeddedLinkedChildren (a CoreInitialisation code
-migration every existing database runs) removed LinkedChildren,
-ExtraIds and SupportsExternalTransfer from BaseItems.Data with
+migration every existing database runs) removed LinkedChildren, ExtraIds
+and SupportsExternalTransfer from BaseItems.Data with
 json_remove()/json_valid() through ExecuteSqlRaw. Those are SQLite
 functions: on PostgreSQL the statement fails with 42883 ("function
-json_valid(text) does not exist"), the migration service restores the
-pre-migration dump and the migration Job exits non-zero. Do the edit in
-provider-neutral C# instead: collect the ids whose Data mentions one of
-the keys, then per batch of 500 load Id + Data, drop the three
-top-level keys with System.Text.Json.Nodes and write changed rows back
-with ExecuteUpdate inside one transaction per batch. Every read is
-materialised before the writes that follow it (Npgsql allows one active
-command per connection). Blobs are re-serialized with JsonDefaults, the
-options they are written with, so kept content comes out byte for byte.
-A blob that is not valid JSON is left alone and counted in a warning
-(json_valid() skipped it too); one that is not a JSON object has no
-top-level keys to drop and is left alone. Includes a test that runs the
-old SQLite statement on a twin of every row and requires identical
-results on 1,007 rows across two batch boundaries (escapes, nested
-keys, key names inside values, malformed JSON, arrays, nulls), under an
-interceptor that refuses a write while a reader is open.
+json_valid(text) does not exist"), the migration fails and the migration
+service restores the pre-migration dump. Do the edit in provider-neutral
+C# instead: collect the ids whose Data mentions one of the keys, then
+per batch of 500 load Id + Data, drop the three top-level keys with
+System.Text.Json.Nodes and write changed rows back with ExecuteUpdate
+inside one transaction per batch. Every read is materialised before the
+writes that follow it (Npgsql allows one active command per connection).
+Blobs are re-serialized with JsonDefaults, the options they are written
+with, so kept content comes out byte for byte. A blob that is not valid
+JSON is left alone and counted in a warning (json_valid() skipped it
+too); one that is not a JSON object has no top-level keys to drop and is
+left alone. Includes a test that runs the old SQLite statement on a twin
+of every row and requires identical results on 1,007 rows across two
+batch boundaries (escapes, nested keys, key names inside values,
+malformed JSON, arrays, nulls), under an interceptor that refuses a
+write while a reader is open.
 Ceiling: one UPDATE per changed row (shortcut: marker in the code) and
 one round trip per batch of reads instead of a single statement; fine
 for a one-time migration.

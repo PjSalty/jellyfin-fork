@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 19:14:12 -0500
-Subject: [PATCH 06/13] hls: hand out the live playlist after the first segment
+Subject: [PATCH 06/15] hls: hand out the live playlist after the first segment
 
 Intent: GetLiveHlsStream (Videos/{itemId}/live.m3u8, the segmented live
 path) waited for the requested MinSegments (2 or 3 when the client

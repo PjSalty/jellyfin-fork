@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Sat, 11 Jul 2026 08:18:32 -0500
-Subject: [PATCH 04/13] devices: read through to the database on token cache
+Subject: [PATCH 04/15] devices: read through to the database on token cache
  miss
 
 Intent: tokens minted by another replica authenticate here: the device/

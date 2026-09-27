@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Sat, 11 Jul 2026 08:18:32 -0500
-Subject: [PATCH 03/13] replication: leader-gate background work
+Subject: [PATCH 03/15] replication: leader-gate background work
 
 Intent: JELLYFIN_ROLE unset or 'leader' behaves exactly like stock; any
 other value disarms scheduled-task triggers, trigger-originated scans,

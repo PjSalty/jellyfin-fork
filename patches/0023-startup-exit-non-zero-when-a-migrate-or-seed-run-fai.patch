@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 12:00:39 -0500
+Subject: [PATCH 15/15] startup: exit non-zero when a migrate or seed run fails
+
+Intent: StartServer catches every exception, logs "Error while starting
+server" and returns, and Main only sets a non-zero exit code for bad
+arguments or a missing web client directory. In --mode MigrateSystem or
+SeedSystem a failing CoreInitialisation or AppInitialisation migration
+is therefore restored from the pre-migration dump and the process still
+exits 0, so a Kubernetes migration Job reports Succeeded after a failed
+and rolled-back pass. In those two modes the catch now sets
+Environment.ExitCode = 1; the server mode is unchanged. A failure in
+PreInitialisation already escapes StartApp and exits non-zero.
+Proven with the image: --mode MigrateSystem against an unreachable
+PostgreSQL exits 1, a successful pass exits 0; the smoke asserts the
+migrate container exits 0 and never logs "Error while starting server".
+Drop when: upstream exits non-zero on a failed one-shot startup mode.
+
+Patch: 0023
+---
+ Jellyfin.Server/Program.cs | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/Jellyfin.Server/Program.cs b/Jellyfin.Server/Program.cs
+index 50fc05d..d558b93 100644
+--- a/Jellyfin.Server/Program.cs
++++ b/Jellyfin.Server/Program.cs
+@@ -256,6 +256,12 @@ namespace Jellyfin.Server
+             {
+                 _restartOnShutdown = false;
+                 _logger.LogCritical(ex, "Error while starting server");
++
++                // A one-shot run (a migration Job) must report its failure; the server mode keeps upstream's exit.
++                if (options.StartupMode is Configuration.StartupMode.MigrateSystem or Configuration.StartupMode.SeedSystem)
++                {
++                    Environment.ExitCode = 1;
++                }
+                 if (_setupServer!.IsAlive && !configurationCompleted)
+                 {
+                     _setupServer!.SoftStop();
+-- 
+2.55.0
+
