@@ -1,0 +1,7 @@
+# The image build reads upstream/ and docker/ only. tests/.sshkeys holds the
+# smoke's generated private keys (root-owned, so a non-root classic builder
+# cannot even read the context), and local bin/obj output would leak a host
+# build into the SDK stage.
+tests/.sshkeys
+upstream/**/bin
+upstream/**/obj

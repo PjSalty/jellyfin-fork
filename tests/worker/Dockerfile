@@ -2,7 +2,7 @@
 # real worker exposes (key-only sshd on 2222, an rffmpeg login user, and
 # jellyfin-ffmpeg at the standard path); CPU encode only, which is all a CI
 # smoke needs to prove the dispatch path.
-FROM jellyfin/jellyfin:10.11.11
+FROM jellyfin/jellyfin:12.1
 RUN sed -i 's|http://|https://|g' /etc/apt/sources.list.d/debian.sources \
     && apt-get update \
     && apt-get install -y --no-install-recommends openssh-server \

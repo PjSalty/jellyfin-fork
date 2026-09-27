@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:18-alpine
     environment:
       POSTGRES_DB: jellyfin
       POSTGRES_USER: jellyfin
@@ -13,27 +13,39 @@ services:
 
   # The PostgreSQL provider plugin comes from the sibling repo's public
   # release (checksummed): the fork consumes the exact artifact users get.
+  # JELLYFIN_PGSQL_VERSION picks the release. JELLYFIN_PGSQL_LOCAL_DIR points
+  # at a directory holding an already-published jellyfin-pgsql-<ver>.zip and
+  # its SHA256SUMS, used instead of downloading (smoke a release before it is
+  # published); it must contain a slash, since a bare name would mount the
+  # empty named volume below instead of the host directory.
   plugin-fetch:
     image: alpine:3.22
+    environment:
+      VER: ${JELLYFIN_PGSQL_VERSION:-12.1-0-salty.1}
     command:
       - /bin/sh
       - -c
       - |
         set -e
         apk add --no-cache curl unzip >/dev/null
-        cd /tmp
-        VER=10.11.11-1-salty.1
-        curl -fsSLO https://github.com/PjSalty/jellyfin-pgsql/releases/download/$$VER/jellyfin-pgsql-$$VER.zip
-        curl -fsSLO https://github.com/PjSalty/jellyfin-pgsql/releases/download/$$VER/SHA256SUMS
+        if [ -f /plugin-local/SHA256SUMS ]; then
+          cd /plugin-local
+          echo "using local plugin files for $$VER"
+        else
+          cd /tmp
+          curl -fsSLO https://github.com/PjSalty/jellyfin-pgsql/releases/download/$$VER/jellyfin-pgsql-$$VER.zip
+          curl -fsSLO https://github.com/PjSalty/jellyfin-pgsql/releases/download/$$VER/SHA256SUMS
+        fi
         sha256sum -c SHA256SUMS
         mkdir -p /config/plugins/PostgreSQL
         unzip -oq jellyfin-pgsql-$$VER.zip -d /config/plugins/PostgreSQL
         echo "plugin staged"
     volumes:
       - config:/config
+      - ${JELLYFIN_PGSQL_LOCAL_DIR:-plugin-local}:/plugin-local:ro
 
-  # Single-writer migration/seed pass (the pattern the Kubernetes Job uses),
-  # exercising patch 0001's --mode and proving replicas never need to migrate.
+  # Single-writer migration/seed pass (the pattern the Kubernetes Job uses):
+  # upstream's --mode MigrateSystem, proving replicas never need to migrate.
   migrate:
     build:
       context: ..
@@ -101,3 +113,5 @@ volumes:
   # Shared /config mirrors the production target: phase 3 moves config to a
   # shared RWX volume so wizard state, plugins, and metadata are one truth.
   config:
+  # Empty unless JELLYFIN_PGSQL_LOCAL_DIR binds a host directory instead.
+  plugin-local:
