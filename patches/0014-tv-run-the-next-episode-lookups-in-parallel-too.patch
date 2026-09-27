@@ -1,0 +1,40 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <hoffman.viking@gmail.com>
+Date: Mon, 31 Aug 2026 02:30:51 -0500
+Subject: [PATCH] tv: run the next-episode lookups in parallel too
+
+The probe went parallel but the next-episode half (one or two grouped
+statements plus a full-row materialisation per series) still ran one
+series at a time and dominated what was left. Ordered PLINQ keeps the
+output order and the null filtering identical; the trade is bounded
+over-computation past the page cut, which a two-dozen-series set never
+reaches.
+---
+ Emby.Server.Implementations/TV/TVSeriesManager.cs | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/Emby.Server.Implementations/TV/TVSeriesManager.cs b/Emby.Server.Implementations/TV/TVSeriesManager.cs
+index a992a018..b99e18cc 100644
+--- a/Emby.Server.Implementations/TV/TVSeriesManager.cs
++++ b/Emby.Server.Implementations/TV/TVSeriesManager.cs
+@@ -139,7 +139,17 @@ namespace Emby.Server.Implementations.TV
+                     .OrderByDescending(i => i.LastWatchedDate);
+             }
+ 
++            // The next-episode lookup is the heavier half (one or two grouped
++            // statements plus a full-row materialisation per series) and was still
++            // sequential after the probe went parallel. Same treatment: ordered
++            // PLINQ keeps the output order and the null filtering identical.
++            // shortcut: this computes every candidate's episode even when the page
++            // cut would have skipped some; revisit with a bounded prefix if a
++            // library ever has hundreds of in-progress series.
+             return allNextUp
++                .AsParallel()
++                .AsOrdered()
++                .WithDegreeOfParallelism(degree)
+                 .Select(i => i.GetEpisodeFunction())
+                 .Where(i => i is not null)!;
+         }
+-- 
+2.55.0
+
