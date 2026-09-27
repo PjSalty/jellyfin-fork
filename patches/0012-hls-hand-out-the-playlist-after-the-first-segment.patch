@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <hoffman.viking@gmail.com>
+Date: Sun, 30 Aug 2026 14:12:35 -0500
+Subject: [PATCH] hls: hand out the playlist after the first segment
+
+The controller waited for the client-requested minimum (two or three
+segments) before returning the playlist, so playback start paid one or
+two extra segment durations while ffmpeg was already producing. Serve a
+growing playlist after the first segment instead: hls.js and ExoPlayer
+poll the playlist and apply their own buffering either way.
+---
+ Jellyfin.Api/Controllers/DynamicHlsController.cs | 11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/Jellyfin.Api/Controllers/DynamicHlsController.cs b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+index c69040d4..cfc80b2f 100644
+--- a/Jellyfin.Api/Controllers/DynamicHlsController.cs
++++ b/Jellyfin.Api/Controllers/DynamicHlsController.cs
+@@ -326,6 +326,17 @@ public class DynamicHlsController : BaseJellyfinApiController
+                     }
+ 
+                     minSegments = state.MinSegments;
++
++                    // Return the playlist as soon as ONE segment exists instead of the
++                    // client-requested two or three: the player starts fetching (and its
++                    // own buffering logic takes over) one-to-two segment durations sooner,
++                    // and ffmpeg keeps producing regardless. Serving a growing playlist is
++                    // ordinary HLS; hls.js (web/webOS) and ExoPlayer (Fire TV) both poll.
++                    if (minSegments > 1)
++                    {
++                        minSegments = 1;
++                    }
++
+                     if (minSegments > 0)
+                     {
+                         await HlsHelpers.WaitForMinimumSegmentCount(playlistPath, minSegments, _logger, cancellationToken).ConfigureAwait(false);
+-- 
+2.55.0
+
