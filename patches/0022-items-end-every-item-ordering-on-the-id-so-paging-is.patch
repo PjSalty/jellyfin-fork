@@ -1,0 +1,127 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 11:17:41 -0500
+Subject: [PATCH 14/14] items: end every item ordering on the id so paging is
+ stable
+
+Intent: ApplyOrder ends on SortName (or SortName, Name), which is not
+unique. Items that share every sort key, such as the episodes of a series
+that all carry the series name because their numbers never parsed, have
+no defined relative order, and a paged request re-sorts per page.
+PostgreSQL's bounded top-N sort orders such ties differently for each
+LIMIT/OFFSET, so a client paging a library by name sees some items twice
+and never sees others. On a copy of a production database, paging one
+5,881-item library 100 at a time returned only 5,724 distinct items
+(157 never came back, 143 came back twice); the same pages on 10.11 over
+the same data were complete. Append the item Id as the last key of every
+ordering ApplyOrder produces, including the SeriesDatePlayed ordering and
+the unordered fallback, so the order is total. Includes a test that every
+ordering ends on the id (fails on stock 12.1).
+Ceiling: orderings built outside ApplyOrder (the people listing, the
+in-memory sorts in LibraryManager.Sort and the NextUp candidate order)
+keep their own tie handling.
+Drop when: upstream ends its item orderings on a unique key.
+
+Patch: 0022
+---
+ .../Item/BaseItemRepository.QueryBuilding.cs  | 11 ++--
+ .../BaseItemRepositoryPagingOrderTests.cs     | 51 +++++++++++++++++++
+ 2 files changed, 58 insertions(+), 4 deletions(-)
+ create mode 100644 tests/Jellyfin.Server.Implementations.Tests/Item/BaseItemRepositoryPagingOrderTests.cs
+
+diff --git a/Jellyfin.Server.Implementations/Item/BaseItemRepository.QueryBuilding.cs b/Jellyfin.Server.Implementations/Item/BaseItemRepository.QueryBuilding.cs
+index 1a4c9da..8ebda7c 100644
+--- a/Jellyfin.Server.Implementations/Item/BaseItemRepository.QueryBuilding.cs
++++ b/Jellyfin.Server.Implementations/Item/BaseItemRepository.QueryBuilding.cs
+@@ -371,7 +371,7 @@ public sealed partial class BaseItemRepository
+ 
+         if (orderedQuery is null)
+         {
+-            return query.OrderBy(e => e.SortName);
++            return query.OrderBy(e => e.SortName).ThenBy(e => e.Id);
+         }
+ 
+         // Add SortName as final tiebreaker
+@@ -380,7 +380,10 @@ public sealed partial class BaseItemRepository
+             orderedQuery = orderedQuery.ThenBy(e => e.SortName);
+         }
+ 
+-        return orderedQuery;
++        // Id last makes the order total. Items sharing every sort key otherwise come back in
++        // whatever order the plan produces, and PostgreSQL's top-N sort orders such ties
++        // differently for each LIMIT/OFFSET, so paging repeats some items and skips others.
++        return orderedQuery.ThenBy(e => e.Id);
+     }
+ 
+     private IQueryable<BaseItemEntity> ApplySeriesDatePlayedOrder(
+@@ -415,8 +418,8 @@ public sealed partial class BaseItemRepository
+         var seriesSort = orderBy.First(o => o.OrderBy == ItemSortBy.SeriesDatePlayed);
+ 
+         return seriesSort.SortOrder == SortOrder.Ascending
+-            ? joined.OrderBy(x => x.MaxDate).ThenBy(x => x.Item.SortName).Select(x => x.Item)
+-            : joined.OrderByDescending(x => x.MaxDate).ThenBy(x => x.Item.SortName).Select(x => x.Item);
++            ? joined.OrderBy(x => x.MaxDate).ThenBy(x => x.Item.SortName).ThenBy(x => x.Item.Id).Select(x => x.Item)
++            : joined.OrderByDescending(x => x.MaxDate).ThenBy(x => x.Item.SortName).ThenBy(x => x.Item.Id).Select(x => x.Item);
+     }
+ 
+     /// <summary>
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Item/BaseItemRepositoryPagingOrderTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Item/BaseItemRepositoryPagingOrderTests.cs
+new file mode 100644
+index 0000000..17d233f
+--- /dev/null
++++ b/tests/Jellyfin.Server.Implementations.Tests/Item/BaseItemRepositoryPagingOrderTests.cs
+@@ -0,0 +1,51 @@
++using System;
++using System.Linq;
++using Emby.Server.Implementations.Data;
++using Jellyfin.Data.Enums;
++using Jellyfin.Database.Implementations.Enums;
++using Jellyfin.Server.Implementations.Item;
++using MediaBrowser.Controller.Entities;
++using Microsoft.EntityFrameworkCore;
++using Xunit;
++
++namespace Jellyfin.Server.Implementations.Tests.Item;
++
++/// <summary>
++/// Paging reads one LIMIT/OFFSET window per request, so the order has to be total: items that share
++/// every sort key (episodes with one unparsed name, remakes with one title) otherwise land in a
++/// different relative order on each page under PostgreSQL's top-N sort, and a client paging the
++/// library sees some items twice and never sees others.
++/// </summary>
++public sealed class BaseItemRepositoryPagingOrderTests : SqliteDbTestFixture
++{
++    private readonly BaseItemRepository _repository;
++
++    public BaseItemRepositoryPagingOrderTests()
++    {
++        _repository = CreateBaseItemRepository(new ItemTypeLookup());
++    }
++
++    public static TheoryData<ItemSortBy[]> Orderings => new()
++    {
++        Array.Empty<ItemSortBy>(),
++        new[] { ItemSortBy.SortName },
++        new[] { ItemSortBy.ProductionYear, ItemSortBy.PremiereDate },
++        new[] { ItemSortBy.SeriesDatePlayed },
++    };
++
++    [Theory]
++    [MemberData(nameof(Orderings))]
++    public void ApplyOrder_EndsOnTheItemId(ItemSortBy[] sortBy)
++    {
++        using var context = CreateDbContext();
++        var filter = new InternalItemsQuery
++        {
++            OrderBy = sortBy.Select(s => (s, SortOrder.Ascending)).ToArray()
++        };
++
++        var sql = _repository.ApplyOrder(context.BaseItems, filter, context).ToQueryString();
++
++        var orderBy = sql[(sql.LastIndexOf("ORDER BY", StringComparison.Ordinal) + "ORDER BY".Length)..];
++        Assert.EndsWith(".\"Id\"", orderBy.Split(',').Last().Trim(), StringComparison.Ordinal);
++    }
++}
+-- 
+2.55.0
+
