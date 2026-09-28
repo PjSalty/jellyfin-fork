@@ -53,3 +53,15 @@ for f in ${files}; do
     replace "${f}" "${saved}" "${saved},${reload}"
     echo "web-patches: display language reload (modern) -> ${f}"
 done
+
+# hls.js demuxer worker: hls.js 1.6 builds its worker from factory.toString(),
+# and the web client's own minifier leaves that function referencing an outer
+# name, so every HLS playback spun up a worker that died with "ReferenceError:
+# e is not defined" before hls.js fell back to inline transmuxing. Start
+# inline: the same playback path, minus the failed worker and its error.
+hls_defaults='t.DefaultConfig.liveBackBufferLength=90,window.Hls=t'
+files="$(chunks 2 "${hls_defaults}")"
+for f in ${files}; do
+    replace "${f}" "${hls_defaults}" 't.DefaultConfig.liveBackBufferLength=90,t.DefaultConfig.enableWorker=!1,window.Hls=t'
+    echo "web-patches: hls.js inline transmuxing -> ${f}"
+done
