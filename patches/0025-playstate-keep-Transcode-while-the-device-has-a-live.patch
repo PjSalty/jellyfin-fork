@@ -1,0 +1,63 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 22:49:55 -0500
+Subject: [PATCH 17/17] playstate: keep Transcode while the device has a live
+ transcode
+
+Intent: ValidatePlayMethod turns a reported Transcode into DirectPlay
+when no transcoding job carries the reported PlaySessionId. A web
+stream change (burned-in subtitle, quality, audio track) stops the old
+job and reports progress with the new PlaySessionId before the new job
+has registered, so the session was stored as DirectPlay, and the
+server's progress timer kept replaying that report, while
+TranscodingInfo showed a live NVENC transcode. The downgrade now also
+requires that no session of the reporting device carries
+TranscodingInfo. The device's running job sets that info, and a
+non-transcode report or a stop clears it, so a real switch to direct
+play still reads DirectPlay.
+Drop when: upstream validates against the device's jobs, or the web
+client reports only after the new job has started.
+
+Patch: 0025
+---
+ Jellyfin.Api/Controllers/PlaystateController.cs | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/Jellyfin.Api/Controllers/PlaystateController.cs b/Jellyfin.Api/Controllers/PlaystateController.cs
+index 4ff1eef..c6178a3 100644
+--- a/Jellyfin.Api/Controllers/PlaystateController.cs
++++ b/Jellyfin.Api/Controllers/PlaystateController.cs
+@@ -1,6 +1,7 @@
+ using System;
+ using System.ComponentModel.DataAnnotations;
+ using System.Diagnostics.CodeAnalysis;
++using System.Linq;
+ using System.Threading.Tasks;
+ using Jellyfin.Api.Extensions;
+ using Jellyfin.Api.Helpers;
+@@ -529,7 +530,7 @@ public class PlaystateController : BaseJellyfinApiController
+         if (method == PlayMethod.Transcode)
+         {
+             var job = string.IsNullOrWhiteSpace(playSessionId) ? null : _transcodeManager.GetTranscodingJob(playSessionId);
+-            if (job is null)
++            if (job is null && !DeviceIsTranscoding())
+             {
+                 return PlayMethod.DirectPlay;
+             }
+@@ -537,4 +538,13 @@ public class PlaystateController : BaseJellyfinApiController
+ 
+         return method;
+     }
++
++    // A stream change reports the new PlaySessionId before its job registers.
++    private bool DeviceIsTranscoding()
++    {
++        var deviceId = User.GetDeviceId();
++        return !string.IsNullOrEmpty(deviceId)
++            && _sessionManager.Sessions.Any(s => s.TranscodingInfo is not null
++                && string.Equals(s.DeviceId, deviceId, StringComparison.OrdinalIgnoreCase));
++    }
+ }
+-- 
+2.55.0
+

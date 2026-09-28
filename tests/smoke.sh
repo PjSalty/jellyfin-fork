@@ -133,6 +133,10 @@ info "asserting the legacy token header is refused (12.x default)"
 code="$(curl -s -o /dev/null -w '%{http_code}' "${LEADER_URL}/Users/Me" -H "X-Emby-Token: ${token}")"
 [ "${code}" = "401" ] || die "legacy X-Emby-Token answered http ${code}, expected 401"
 
+info "asserting the api_key query parameter is accepted (0024: web socket and Download)"
+code="$(curl -s -o /dev/null -w '%{http_code}' "${LEADER_URL}/Users/Me?api_key=${token}")"
+[ "${code}" = "200" ] || die "api_key query answered http ${code}, expected 200"
+
 info "asserting the LEADER-minted token works on the REPLICA (read-through)"
 code="$(curl -s -o /dev/null -w '%{http_code}' "${REPLICA_URL}/Users/Me" -H "${token_header}")"
 [ "${code}" = "200" ] || die "replica rejected a leader-minted token (http ${code}): read-through broken"
