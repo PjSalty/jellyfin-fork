@@ -76,3 +76,8 @@ RUN mv /jellyfin/jellyfin-web /tmp/jellyfin-web-keep \
     && mv /tmp/jellyfin-web-keep /jellyfin/jellyfin-web \
     && { [ -z "${LD_PRELOAD:-}" ] || [ -r "${LD_PRELOAD}" ]; }
 COPY --from=build /out/ /jellyfin/
+
+# Anchored jellyfin-web patches (see the script); a base bump that moves the
+# patched code fails here instead of shipping an unpatched client.
+COPY docker/web-patches.sh /tmp/web-patches.sh
+RUN sh /tmp/web-patches.sh /jellyfin/jellyfin-web && rm /tmp/web-patches.sh

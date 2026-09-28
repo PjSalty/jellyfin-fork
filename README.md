@@ -31,7 +31,7 @@ To wire it up: mount a client key and `known_hosts` at `/etc/rffmpeg/ssh/`, run 
 docker build -f docker/Dockerfile -t jellyfin-fork:local .
 ```
 
-The image compiles the patched server and overlays the binaries onto the official image, keeping its web client and ffmpeg.
+The image compiles the patched server and overlays the binaries onto the official image, keeping its web client (plus the anchored edits in `docker/web-patches.sh`) and ffmpeg.
 
 `./tests/smoke.sh` runs the migrate Job, a leader and a replica against PostgreSQL 18 with the [jellyfin-pgsql](https://github.com/PjSalty/jellyfin-pgsql) release named by `JELLYFIN_PGSQL_VERSION`; set `JELLYFIN_PGSQL_LOCAL_DIR` to a directory holding a release zip and its `SHA256SUMS` to smoke a plugin build before it is published.
 

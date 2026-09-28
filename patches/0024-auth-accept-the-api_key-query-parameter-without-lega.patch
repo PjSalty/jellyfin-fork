@@ -1,0 +1,43 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 22:49:55 -0500
+Subject: [PATCH 16/17] auth: accept the api_key query parameter without legacy
+ authorization
+
+Intent: 12.1 switches EnableLegacyAuthorization off on upgrade (the
+DisableLegacyAuthorization migration), after which AuthorizationContext
+reads only ApiKey from the query string. The official 12.1 jellyfin-web
+still opens its WebSocket as socket?api_key= and builds the Download
+link with api_key, so every web session had its socket refused with 403
+(no remote control, SyncPlay or live updates) and Download failed.
+api_key is now read like ApiKey whatever the legacy setting. It is the
+same token in the same place, so nothing new is accepted; the
+X-Emby-Token and X-MediaBrowser-Token headers and the Emby scheme stay
+behind the setting.
+Proven with the image: the smoke asserts /Users/Me?api_key= answers 200
+while the X-Emby-Token header is still refused.
+Drop when: jellyfin-web sends ApiKey on its socket and Download URLs, or
+upstream reads api_key again.
+
+Patch: 0024
+---
+ .../Security/AuthorizationContext.cs                           | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/Jellyfin.Server.Implementations/Security/AuthorizationContext.cs b/Jellyfin.Server.Implementations/Security/AuthorizationContext.cs
+index 8657cb7..ebe76a2 100644
+--- a/Jellyfin.Server.Implementations/Security/AuthorizationContext.cs
++++ b/Jellyfin.Server.Implementations/Security/AuthorizationContext.cs
+@@ -105,7 +105,8 @@ namespace Jellyfin.Server.Implementations.Security
+                 token = queryString["ApiKey"];
+             }
+ 
+-            if (_configurationManager.Configuration.EnableLegacyAuthorization && string.IsNullOrEmpty(token))
++            // The 12.1 web client still sends api_key on the socket URL and Download links.
++            if (string.IsNullOrEmpty(token))
+             {
+                 token = queryString["api_key"];
+             }
+-- 
+2.55.0
+
