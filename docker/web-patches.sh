@@ -5,7 +5,7 @@
 #              patch names how many chunks carry its anchor and every anchor
 #              must occur exactly once per chunk, so a web bump that moves the
 #              code fails the build instead of shipping a silent no-op.
-#              Anchors are minified names from jellyfin-web 12.1: re-derive
+#              Anchors are minified names from jellyfin-web 12.1, unchanged in 12.2: re-derive
 #              them on a base bump.
 # Usage: web-patches.sh <jellyfin-web dir>
 #

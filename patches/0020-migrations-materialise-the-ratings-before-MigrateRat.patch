@@ -24,15 +24,15 @@ Drop when: upstream materialises the query.
 
 Patch: 0020
 ---
- .../20260910120000_MigrateRatingLevels.cs     |   4 +-
+ .../20260915120000_MigrateRatingLevels.cs     |   4 +-
  .../Migrations/MigrateRatingLevelsTests.cs    | 141 ++++++++++++++++++
  2 files changed, 144 insertions(+), 1 deletion(-)
  create mode 100644 tests/Jellyfin.Server.Tests/Migrations/MigrateRatingLevelsTests.cs
 
-diff --git a/Jellyfin.Server/Migrations/Routines/20260910120000_MigrateRatingLevels.cs b/Jellyfin.Server/Migrations/Routines/20260910120000_MigrateRatingLevels.cs
-index a456acf..cc6da6d 100644
---- a/Jellyfin.Server/Migrations/Routines/20260910120000_MigrateRatingLevels.cs
-+++ b/Jellyfin.Server/Migrations/Routines/20260910120000_MigrateRatingLevels.cs
+diff --git a/Jellyfin.Server/Migrations/Routines/20260915120000_MigrateRatingLevels.cs b/Jellyfin.Server/Migrations/Routines/20260915120000_MigrateRatingLevels.cs
+index 903d91e..a4f6925 100644
+--- a/Jellyfin.Server/Migrations/Routines/20260915120000_MigrateRatingLevels.cs
++++ b/Jellyfin.Server/Migrations/Routines/20260915120000_MigrateRatingLevels.cs
 @@ -36,7 +36,9 @@ internal class MigrateRatingLevels : IDatabaseMigrationRoutine
          _logger.LogInformation("Recalculating parental rating levels based on rating string.");
          using var context = _provider.CreateDbContext();

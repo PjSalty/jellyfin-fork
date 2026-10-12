@@ -1,6 +1,6 @@
 # jellyfin-fork
 
-Jellyfin server overlay for multi-replica operation on Kubernetes: a pinned upstream release (currently v12.1) plus a short series of patches. Migration gating, leader-gated background work, cross-replica token validity, conflict-safe concurrent writes, and PostgreSQL-safe versions of the upstream migrations that only ran on SQLite. Pairs with [jellyfin-pgsql](https://github.com/PjSalty/jellyfin-pgsql) (PostgreSQL provider + Valkey second level cache), which carries the database side with zero server patches.
+Jellyfin server overlay for multi-replica operation on Kubernetes: a pinned upstream release (currently v12.2) plus a short series of patches. Migration gating, leader-gated background work, cross-replica token validity, conflict-safe concurrent writes, and PostgreSQL-safe versions of the upstream migrations that only ran on SQLite. Pairs with [jellyfin-pgsql](https://github.com/PjSalty/jellyfin-pgsql) (PostgreSQL provider + Valkey second level cache), which carries the database side with zero server patches.
 
 This is an overlay build, not a diverged fork: `UPSTREAM_REF` pins the upstream release, `patches/` holds the changes with intent and drop-when conditions in their messages, and CI reassembles from pristine upstream on every run. `DIVERGENCE.md` is the complete list.
 
