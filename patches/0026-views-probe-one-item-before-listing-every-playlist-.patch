@@ -1,0 +1,186 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sun, 11 Oct 2026 21:47:45 -0500
+Subject: [PATCH 18/18] views: probe one item before listing every playlist or
+ collection
+
+Intent: since 12.2, UserViewManager.HasVisibleItem decides whether the
+Playlists and Collections views are shown by loading every playlist (or
+collection) under the user's library folders, each joined to its linked
+children, and asking whether any is visible. Views are resolved on every
+browse request, so every such request paid for it: about 730 wide rows
+and 15 ms per request on a library with 60 playlists, the whole
+difference between 12.1 and 12.2 in a side-by-side load test. One item
+is now loaded first. None means nothing to show, and a visible one
+settles the question, so the full list is only loaded when that first
+item is not visible to the user. The answer is the same in every case.
+UserViewManagerVisibilityProbeTests covers each branch and the number
+of list queries it takes.
+Drop when: upstream answers the question with a bounded query.
+Ceiling: a user whose first playlist by id is one they cannot see still
+pays for the full list on top of the probe.
+---
+ .../Library/UserViewManager.cs                |  33 +++++-
+ .../UserViewManagerVisibilityProbeTests.cs    | 102 ++++++++++++++++++
+ 2 files changed, 130 insertions(+), 5 deletions(-)
+ create mode 100644 tests/Jellyfin.Server.Implementations.Tests/Library/UserViewManagerVisibilityProbeTests.cs
+
+diff --git a/Emby.Server.Implementations/Library/UserViewManager.cs b/Emby.Server.Implementations/Library/UserViewManager.cs
+index 6d52ce7..321a876 100644
+--- a/Emby.Server.Implementations/Library/UserViewManager.cs
++++ b/Emby.Server.Implementations/Library/UserViewManager.cs
+@@ -166,15 +166,38 @@ namespace Emby.Server.Implementations.Library
+                 return false;
+             }
+ 
+-            var items = _libraryManager.GetItemList(new InternalItemsQuery(user)
++            // This runs whenever the user's views are resolved, which is on every browse
++            // request. Loading every playlist or collection, each joined to its linked
++            // children, only to ask whether any one is visible returned ~730 wide rows per
++            // request on a 60 playlist library. Probe a single item first: none means there
++            // is nothing to show, and a visible one settles the question. Only an invisible
++            // first item needs the full list.
++            var probe = _libraryManager.GetItemList(CreateVisibilityQuery(itemKind, topParentIds, user, 1));
++            if (probe.Count == 0)
++            {
++                return false;
++            }
++
++            if (probe[0].IsVisible(user))
++            {
++                return true;
++            }
++
++            var items = _libraryManager.GetItemList(CreateVisibilityQuery(itemKind, topParentIds, user, null));
++
++            return items.Any(item => item.IsVisible(user));
++        }
++
++        private static InternalItemsQuery CreateVisibilityQuery(BaseItemKind itemKind, Guid[] topParentIds, User user, int? limit)
++        {
++            return new InternalItemsQuery(user)
+             {
+                 IncludeItemTypes = [itemKind],
+                 TopParentIds = topParentIds,
+                 GroupByPresentationUniqueKey = false,
+-                DtoOptions = DtoOptions.StoredColumnsOnly
+-            });
+-
+-            return items.Any(item => item.IsVisible(user));
++                DtoOptions = DtoOptions.StoredColumnsOnly,
++                Limit = limit
++            };
+         }
+ 
+         private static IEnumerable<Guid> GetTopParentIds(Folder folder)
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/Library/UserViewManagerVisibilityProbeTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Library/UserViewManagerVisibilityProbeTests.cs
+new file mode 100644
+index 0000000..4b042a7
+--- /dev/null
++++ b/tests/Jellyfin.Server.Implementations.Tests/Library/UserViewManagerVisibilityProbeTests.cs
+@@ -0,0 +1,102 @@
++using System;
++using System.Collections.Generic;
++using System.Reflection;
++using Emby.Server.Implementations.Library;
++using Jellyfin.Data.Enums;
++using Jellyfin.Database.Implementations.Entities;
++using MediaBrowser.Controller.Channels;
++using MediaBrowser.Controller.Configuration;
++using MediaBrowser.Controller.Entities;
++using MediaBrowser.Controller.Library;
++using MediaBrowser.Controller.LiveTv;
++using MediaBrowser.Model.Globalization;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.Server.Implementations.Tests.Library;
++
++/// <summary>
++/// Covers the single-item probe in <c>UserViewManager.HasVisibleItem</c>: it must answer
++/// exactly what the full list answers, and only fall back to the full list when the probed
++/// item is not visible to the user.
++/// </summary>
++public sealed class UserViewManagerVisibilityProbeTests
++{
++    private static readonly MethodInfo _hasVisibleItem = typeof(UserViewManager)
++        .GetMethod("HasVisibleItem", BindingFlags.Instance | BindingFlags.NonPublic)!;
++
++    private readonly User _user = new("probe-user", "provider", "reset-provider");
++    private readonly List<int?> _limits = [];
++
++    [Fact]
++    public void NoItems_IsFalse_WithoutLoadingTheFullList()
++    {
++        Assert.False(Invoke([]));
++        Assert.Equal([1], _limits);
++    }
++
++    [Fact]
++    public void VisibleFirstItem_IsTrue_WithoutLoadingTheFullList()
++    {
++        Assert.True(Invoke([new StubItem(true), new StubItem(false)]));
++        Assert.Equal([1], _limits);
++    }
++
++    [Fact]
++    public void InvisibleFirstItem_FallsBackToTheFullList()
++    {
++        Assert.True(Invoke([new StubItem(false), new StubItem(true)]));
++        Assert.Equal([1, null], _limits);
++    }
++
++    [Fact]
++    public void NoVisibleItem_IsFalse_AfterTheFullList()
++    {
++        Assert.False(Invoke([new StubItem(false), new StubItem(false)]));
++        Assert.Equal([1, null], _limits);
++    }
++
++    [Fact]
++    public void NoFolders_IsFalse_WithoutAnyQuery()
++    {
++        var manager = CreateManager([new StubItem(true)]);
++
++        var result = (bool)_hasVisibleItem.Invoke(manager, [BaseItemKind.Playlist, Array.Empty<Folder>(), _user])!;
++
++        Assert.False(result);
++        Assert.Empty(_limits);
++    }
++
++    private bool Invoke(BaseItem[] items)
++    {
++        var manager = CreateManager(items);
++        Folder[] folders = [new Folder { Id = Guid.NewGuid() }];
++
++        return (bool)_hasVisibleItem.Invoke(manager, [BaseItemKind.Playlist, folders, _user])!;
++    }
++
++    private UserViewManager CreateManager(BaseItem[] items)
++    {
++        var libraryManager = new Mock<ILibraryManager>();
++        libraryManager
++            .Setup(m => m.GetItemList(It.IsAny<InternalItemsQuery>()))
++            .Returns((InternalItemsQuery query) =>
++            {
++                _limits.Add(query.Limit);
++                Assert.Equal([BaseItemKind.Playlist], query.IncludeItemTypes);
++                return query.Limit is int limit ? items[..Math.Min(limit, items.Length)] : items;
++            });
++
++        return new UserViewManager(
++            libraryManager.Object,
++            Mock.Of<ILocalizationManager>(),
++            Mock.Of<IChannelManager>(),
++            Mock.Of<ILiveTvManager>(),
++            Mock.Of<IServerConfigurationManager>());
++    }
++
++    private sealed class StubItem(bool visible) : BaseItem
++    {
++        public override bool IsVisible(User user, bool skipAllowedTagsCheck = false) => visible;
++    }
++}
+-- 
+2.55.0
+
