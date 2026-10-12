@@ -24,5 +24,16 @@ jobs:
       - name: Build the patched server
         run: dotnet build upstream/Jellyfin.Server/Jellyfin.Server.csproj -c Release
 
+      # Every test project, not a filter: patches carry their own tests and
+      # can break upstream ones. One project at a time and for one runtime:
+      # built without a runtime identifier, each test project copies the
+      # native libraries of every platform into its output, about 9 GB for
+      # the solution against 1 GB this way.
+      - name: Run the upstream test suite on the patched tree
+        run: |
+          for proj in upstream/tests/*/*.csproj; do
+            dotnet test "$proj" -c Release -r linux-x64
+          done
+
       - name: Smoke test (migrate pass + leader + replica on Postgres)
         run: ./tests/smoke.sh
