@@ -21,8 +21,8 @@ Ceiling: a user whose first playlist by id is one they cannot see still
 pays for the full list on top of the probe.
 ---
  .../Library/UserViewManager.cs                |  33 +++++-
- .../UserViewManagerVisibilityProbeTests.cs    | 102 ++++++++++++++++++
- 2 files changed, 130 insertions(+), 5 deletions(-)
+ .../UserViewManagerVisibilityProbeTests.cs    | 106 ++++++++++++++++++
+ 2 files changed, 134 insertions(+), 5 deletions(-)
  create mode 100644 tests/Jellyfin.Server.Implementations.Tests/Library/UserViewManagerVisibilityProbeTests.cs
 
 diff --git a/Emby.Server.Implementations/Library/UserViewManager.cs b/Emby.Server.Implementations/Library/UserViewManager.cs
@@ -75,10 +75,10 @@ index 6d52ce7..321a876 100644
          private static IEnumerable<Guid> GetTopParentIds(Folder folder)
 diff --git a/tests/Jellyfin.Server.Implementations.Tests/Library/UserViewManagerVisibilityProbeTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Library/UserViewManagerVisibilityProbeTests.cs
 new file mode 100644
-index 0000000..4b042a7
+index 0000000..ffde62c
 --- /dev/null
 +++ b/tests/Jellyfin.Server.Implementations.Tests/Library/UserViewManagerVisibilityProbeTests.cs
-@@ -0,0 +1,102 @@
+@@ -0,0 +1,106 @@
 +using System;
 +using System.Collections.Generic;
 +using System.Reflection;
@@ -119,28 +119,28 @@ index 0000000..4b042a7
 +    [Fact]
 +    public void VisibleFirstItem_IsTrue_WithoutLoadingTheFullList()
 +    {
-+        Assert.True(Invoke([new StubItem(true), new StubItem(false)]));
++        Assert.True(Invoke([StubItem(true), StubItem(false)]));
 +        Assert.Equal([1], _limits);
 +    }
 +
 +    [Fact]
 +    public void InvisibleFirstItem_FallsBackToTheFullList()
 +    {
-+        Assert.True(Invoke([new StubItem(false), new StubItem(true)]));
++        Assert.True(Invoke([StubItem(false), StubItem(true)]));
 +        Assert.Equal([1, null], _limits);
 +    }
 +
 +    [Fact]
 +    public void NoVisibleItem_IsFalse_AfterTheFullList()
 +    {
-+        Assert.False(Invoke([new StubItem(false), new StubItem(false)]));
++        Assert.False(Invoke([StubItem(false), StubItem(false)]));
 +        Assert.Equal([1, null], _limits);
 +    }
 +
 +    [Fact]
 +    public void NoFolders_IsFalse_WithoutAnyQuery()
 +    {
-+        var manager = CreateManager([new StubItem(true)]);
++        var manager = CreateManager([StubItem(true)]);
 +
 +        var result = (bool)_hasVisibleItem.Invoke(manager, [BaseItemKind.Playlist, Array.Empty<Folder>(), _user])!;
 +
@@ -176,9 +176,13 @@ index 0000000..4b042a7
 +            Mock.Of<IServerConfigurationManager>());
 +    }
 +
-+    private sealed class StubItem(bool visible) : BaseItem
++    // A mock, not a subclass: BaseItemKindTests instantiates every concrete BaseItem type it finds in the project
++    // assemblies, this one included, and expects each to map to a BaseItemKind.
++    private static BaseItem StubItem(bool visible)
 +    {
-+        public override bool IsVisible(User user, bool skipAllowedTagsCheck = false) => visible;
++        var item = new Mock<BaseItem>();
++        item.Setup(i => i.IsVisible(It.IsAny<User>(), It.IsAny<bool>())).Returns(visible);
++        return item.Object;
 +    }
 +}
 -- 
