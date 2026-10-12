@@ -1,0 +1,184 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Mon, 12 Oct 2026 10:22:51 -0500
+Subject: [PATCH 19/19] migrations: restore inherited rating scores in
+ MigrateRatingLevels
+
+Intent: MigrateRatingLevels rewrites the stored score of every item from
+its own OfficialRating, which sets InheritedParentalRatingValue and
+InheritedParentalRatingSubValue to NULL on every item that has no rating
+of its own. Before the routine ran, those rows carried the score of
+their show: OnMetadataChanged derives it from the display parent on
+every save. List queries filter on the stored column and treat NULL as
+unrated, so from the routine until the next save of each item a profile
+with a rating limit that does not block unrated items is listed the
+seasons and episodes of shows above its limit (detail and playback
+still refuse them, those check the rating in memory). Upstream re-dated
+the routine at 12.1 and again at 12.2, so every existing database went
+through that on both upgrades: 6,985 rows on the library this was found
+on, put right only by the first full library scan. After the per-rating
+loop, give each unscored item without a rating of its own the stored
+score of its display parent (episode -> season -> series, anything else
+-> parent), one level per pass until a pass changes nothing, inside the
+routine's transaction. Items with a custom rating are left to the next
+save, as the routine leaves them today. Includes a test.
+Ceiling: builds on the test file 0020 adds and shares its ceiling: the
+routine's file name carries its date, so the patch is rebased onto each
+re-dated file. The walk reads the stored SeasonId, SeriesId and
+ParentId; an item type that starts overriding DisplayParentId needs a
+branch here.
+Drop when: upstream scores inherited ratings in the routine, or stops
+filtering lists on the stored column.
+
+Patch: 0027
+---
+ .../20260915120000_MigrateRatingLevels.cs     | 39 +++++++++++++
+ .../Migrations/MigrateRatingLevelsTests.cs    | 55 ++++++++++++++++++-
+ 2 files changed, 92 insertions(+), 2 deletions(-)
+
+diff --git a/Jellyfin.Server/Migrations/Routines/20260915120000_MigrateRatingLevels.cs b/Jellyfin.Server/Migrations/Routines/20260915120000_MigrateRatingLevels.cs
+index a4f6925..2932d4e 100644
+--- a/Jellyfin.Server/Migrations/Routines/20260915120000_MigrateRatingLevels.cs
++++ b/Jellyfin.Server/Migrations/Routines/20260915120000_MigrateRatingLevels.cs
+@@ -1,6 +1,8 @@
++using System;
+ using System.Linq;
+ using Jellyfin.Database.Implementations;
+ using Jellyfin.Server.ServerSetupApp;
++using MediaBrowser.Controller.Entities.TV;
+ using MediaBrowser.Model.Globalization;
+ using Microsoft.EntityFrameworkCore;
+ using Microsoft.Extensions.Logging;
+@@ -16,6 +18,12 @@ namespace Jellyfin.Server.Migrations.Routines;
+ #pragma warning restore CS0618 // Type or member is obsolete
+ internal class MigrateRatingLevels : IDatabaseMigrationRoutine
+ {
++    // A walk up the display parents ends at the library root long before this; the bound only stops a parent cycle.
++    private const int MaxInheritanceDepth = 16;
++
++    private static readonly string _episodeType = typeof(Episode).FullName!;
++    private static readonly string _seasonType = typeof(Season).FullName!;
++
+     private readonly IStartupLogger _logger;
+     private readonly IDbContextFactory<JellyfinDbContext> _provider;
+     private readonly ILocalizationManager _localizationManager;
+@@ -65,6 +73,37 @@ internal class MigrateRatingLevels : IDatabaseMigrationRoutine
+             }
+         }
+ 
++        // The loop leaves every item without a rating of its own unscored, and list queries filter on the stored
++        // score, so until such an item is next saved a limited profile is listed the seasons and episodes of shows
++        // above its limit. Hand each one the score of its display parent (episode -> season -> series, anything
++        // else -> parent), one level per pass, which is what OnMetadataChanged derives on a save. Items with a
++        // custom rating are left to that save: the loop above does not score custom ratings either.
++        var restored = 0;
++        for (var depth = 0; depth < MaxInheritanceDepth; depth++)
++        {
++            var filled = context.BaseItems
++                .Where(e => (e.OfficialRating == null || e.OfficialRating == string.Empty)
++                    && (e.CustomRating == null || e.CustomRating == string.Empty)
++                    && e.InheritedParentalRatingValue == null)
++                .Join(
++                    context.BaseItems.Where(p => p.InheritedParentalRatingValue != null
++                        && (p.CustomRating == null || p.CustomRating == string.Empty)),
++                    e => e.Type == _episodeType ? e.SeasonId : e.Type == _seasonType ? e.SeriesId : e.ParentId,
++                    p => (Guid?)p.Id,
++                    (e, p) => new { Item = e, Parent = p })
++                .ExecuteUpdate(f => f
++                    .SetProperty(x => x.Item.InheritedParentalRatingValue, x => x.Parent.InheritedParentalRatingValue)
++                    .SetProperty(x => x.Item.InheritedParentalRatingSubValue, x => x.Parent.InheritedParentalRatingSubValue));
++            if (filled == 0)
++            {
++                break;
++            }
++
++            restored += filled;
++        }
++
++        _logger.LogInformation("Restored the inherited parental rating level of {Count} items without a rating of their own.", restored);
++
+         transaction.Commit();
+     }
+ }
+diff --git a/tests/Jellyfin.Server.Tests/Migrations/MigrateRatingLevelsTests.cs b/tests/Jellyfin.Server.Tests/Migrations/MigrateRatingLevelsTests.cs
+index 06eead6..12a7e30 100644
+--- a/tests/Jellyfin.Server.Tests/Migrations/MigrateRatingLevelsTests.cs
++++ b/tests/Jellyfin.Server.Tests/Migrations/MigrateRatingLevelsTests.cs
+@@ -28,6 +28,12 @@ namespace Jellyfin.Server.Tests.Migrations;
+ /// </summary>
+ public sealed class MigrateRatingLevelsTests : IDisposable
+ {
++    private const string MovieType = "MediaBrowser.Controller.Entities.Movies.Movie";
++    private const string FolderType = "MediaBrowser.Controller.Entities.Folder";
++    private const string SeriesType = "MediaBrowser.Controller.Entities.TV.Series";
++    private const string SeasonType = "MediaBrowser.Controller.Entities.TV.Season";
++    private const string EpisodeType = "MediaBrowser.Controller.Entities.TV.Episode";
++
+     private readonly SqliteConnection _connection;
+     private readonly DbContextOptions<JellyfinDbContext> _dbOptions;
+ 
+@@ -68,14 +74,59 @@ public sealed class MigrateRatingLevelsTests : IDisposable
+         Assert.Equal(((int?)null, (int?)null), scores[blank]);
+     }
+ 
+-    private Guid AddItem(string? rating)
++    [Fact]
++    public void Perform_ItemsWithoutOwnRating_TakeTheScoreOfTheNearestRatedDisplayParent()
++    {
++        var series = AddItem("R", SeriesType);
++        var season = AddItem(null, SeasonType, seriesId: series);
++        var episode = AddItem(string.Empty, EpisodeType, seasonId: season, seriesId: series);
++        var ratedEpisode = AddItem("PG-13", EpisodeType, seasonId: season, seriesId: series);
++        var episodeWithoutSeason = AddItem(null, EpisodeType, seriesId: series);
++        var customSeason = AddItem(null, SeasonType, seriesId: series, customRating: "Family");
++        var episodeUnderCustomSeason = AddItem(null, EpisodeType, seasonId: customSeason, seriesId: series);
++        var ratedFolder = AddItem("PG-13", FolderType);
++        var subFolder = AddItem(null, FolderType, parentId: ratedFolder);
++        var nestedMovie = AddItem(null, MovieType, parentId: subFolder);
++        var movieUnderSeries = AddItem(null, MovieType, seriesId: series);
++
++        CreateMigration().Perform();
++
++        using var context = CreateDbContext();
++        var scores = context.BaseItems.ToDictionary(e => e.Id, e => (e.InheritedParentalRatingValue, e.InheritedParentalRatingSubValue));
++        Assert.Equal((17, (int?)1), scores[series]);
++        Assert.Equal((17, (int?)1), scores[season]);
++        Assert.Equal((17, (int?)1), scores[episode]);
++        Assert.Equal((13, (int?)null), scores[ratedEpisode]);
++        Assert.Equal((13, (int?)null), scores[subFolder]);
++        Assert.Equal((13, (int?)null), scores[nestedMovie]);
++
++        // An episode's display parent is its season and nothing else; only episodes and seasons follow SeriesId.
++        Assert.Equal(((int?)null, (int?)null), scores[episodeWithoutSeason]);
++        Assert.Equal(((int?)null, (int?)null), scores[movieUnderSeries]);
++
++        // A custom rating is scored by the next save, here and in the items below it.
++        Assert.Equal(((int?)null, (int?)null), scores[customSeason]);
++        Assert.Equal(((int?)null, (int?)null), scores[episodeUnderCustomSeason]);
++    }
++
++    private Guid AddItem(
++        string? rating,
++        string type = MovieType,
++        Guid? parentId = null,
++        Guid? seasonId = null,
++        Guid? seriesId = null,
++        string? customRating = null)
+     {
+         using var context = CreateDbContext();
+         var id = Guid.NewGuid();
+         context.BaseItems.Add(new BaseItemEntity
+         {
+             Id = id,
+-            Type = "MediaBrowser.Controller.Entities.Movies.Movie",
++            Type = type,
++            ParentId = parentId,
++            SeasonId = seasonId,
++            SeriesId = seriesId,
++            CustomRating = customRating,
+             OfficialRating = rating,
+             InheritedParentalRatingValue = 99,
+             InheritedParentalRatingSubValue = 99
+-- 
+2.55.0
+
