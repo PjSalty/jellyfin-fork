@@ -1,8 +1,8 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Salty <99386653+PjSalty@users.noreply.github.com>
 Date: Tue, 1 Sep 2026 08:42:08 -0500
-Subject: [PATCH 08/15] userdata: upsert saves so duplicate reports cannot race
- the key
+Subject: [PATCH 08/15] userdata: upsert saves so duplicate reports cannot race the
+ key
 
 Intent: SaveUserData checked for an existing row and then Added or
 Attached, so duplicate progress/stop reports for the same
@@ -38,16 +38,16 @@ Drop when: upstream makes SaveUserData conflict-safe.
 
 Patch: 0016
 ---
- .../Library/UserDataManager.cs                |  38 +++-
+ .../Library/UserDataManager.cs                |  39 +++-
  .../Library/UserDataUpsertTests.cs            | 174 ++++++++++++++++++
- 2 files changed, 203 insertions(+), 9 deletions(-)
+ 2 files changed, 203 insertions(+), 10 deletions(-)
  create mode 100644 tests/Jellyfin.Server.Implementations.Tests/Library/UserDataUpsertTests.cs
 
 diff --git a/Emby.Server.Implementations/Library/UserDataManager.cs b/Emby.Server.Implementations/Library/UserDataManager.cs
-index 0680046..010489a 100644
+index 1e7068b..d7335e0 100644
 --- a/Emby.Server.Implementations/Library/UserDataManager.cs
 +++ b/Emby.Server.Implementations/Library/UserDataManager.cs
-@@ -64,17 +64,37 @@ namespace Emby.Server.Implementations.Library
+@@ -64,17 +64,36 @@ namespace Emby.Server.Implementations.Library
              {
                  userData.Key = key;
                  var userDataEntry = Map(userData, user.Id, item.Id);
@@ -59,7 +59,9 @@ index 0680046..010489a 100644
 -                {
 -                    dbContext.UserData.Add(userDataEntry);
 -                }
-+
+-            }
+ 
+-            dbContext.SaveChanges();
 +                // Duplicate progress/stop reports race the exists-check: two saves for
 +                // the same (ItemId, UserId, CustomDataKey) can both miss it, both INSERT,
 +                // and the loser aborts on the primary key (surfaces as HTTP 500 on
@@ -88,12 +90,10 @@ index 0680046..010489a 100644
 +                        "Likes" = excluded."Likes",
 +                        "RetentionDate" = excluded."RetentionDate"
 +                    """);
-             }
++            }
  
--            dbContext.SaveChanges();
-             transaction.Commit();
- 
-             var userId = user.InternalId;
+             // Rows under keys the item no longer reports are kept, not deleted: the key set is briefly
+             // incomplete mid-refresh, and those rows are what a deleted and re-added item reattaches by.
 diff --git a/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataUpsertTests.cs b/tests/Jellyfin.Server.Implementations.Tests/Library/UserDataUpsertTests.cs
 new file mode 100644
 index 0000000..cbf014c
