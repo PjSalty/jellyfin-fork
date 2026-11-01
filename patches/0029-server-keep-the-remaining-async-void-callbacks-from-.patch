@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 11:10:18 -0600
+Subject: [PATCH 21/21] server: keep the remaining async void callbacks from ending
+ the process
+
+Intent: four more callbacks are async void with no exception handling,
+so any exception escaping them ends the server process the way the user
+data notifier did (patch 0028): WebSocketController.OnConnectionClosed
+(threw ObjectDisposedException after disposal, and CloseIfNeededAsync
+reaches the database), ScheduledTaskWorker.OnTriggerTriggered (queues
+the task and re-arms the trigger, reading the last result from disk),
+StartupTrigger.Start (fires the trigger handlers after its delay) and
+RecordingsManager.OnNamedConfigurationUpdated (creates the recording
+folders). Each now logs the error and carries on; a disposed websocket
+controller returns instead of throwing. LibraryChangedNotifier
+abandoned every remaining user when one user's update info failed to
+build; it now skips that user and continues.
+Ceiling: guards only; the failed piece of work (one websocket cleanup,
+one trigger firing, one folder creation, one user's library update) is
+dropped and logged, not retried. No new tests: the existing
+Jellyfin.Server.Implementations.Tests (1093 passed) and
+Jellyfin.LiveTv.Tests (78 passed) pass on the patched tree.
+Drop when: upstream guards these callbacks or makes them return Task.
+Patch: 0029
+---
+ .../EntryPoints/LibraryChangedNotifier.cs     |  5 ++-
+ .../ScheduledTasks/ScheduledTaskWorker.cs     | 42 +++++++++++--------
+ .../ScheduledTasks/Triggers/StartupTrigger.cs | 14 +++++--
+ .../Session/WebSocketController.cs            | 31 +++++++++-----
+ .../Recordings/RecordingsManager.cs           | 10 ++++-
+ 5 files changed, 69 insertions(+), 33 deletions(-)
+
+diff --git a/Emby.Server.Implementations/EntryPoints/LibraryChangedNotifier.cs b/Emby.Server.Implementations/EntryPoints/LibraryChangedNotifier.cs
+index 02b1047..f40a12a 100644
+--- a/Emby.Server.Implementations/EntryPoints/LibraryChangedNotifier.cs
++++ b/Emby.Server.Implementations/EntryPoints/LibraryChangedNotifier.cs
+@@ -281,8 +281,9 @@ public sealed class LibraryChangedNotifier : IHostedService, IDisposable
+             }
+             catch (Exception ex)
+             {
+-                _logger.LogError(ex, "Error in GetLibraryUpdateInfo");
+-                return;
++                // One user's failure must not cost the users after it their notifications.
++                _logger.LogError(ex, "Error in GetLibraryUpdateInfo for user {UserId}", userId);
++                continue;
+             }
+ 
+             if (info.IsEmpty)
+diff --git a/Emby.Server.Implementations/ScheduledTasks/ScheduledTaskWorker.cs b/Emby.Server.Implementations/ScheduledTasks/ScheduledTaskWorker.cs
+index 06230cb..160817c 100644
+--- a/Emby.Server.Implementations/ScheduledTasks/ScheduledTaskWorker.cs
++++ b/Emby.Server.Implementations/ScheduledTasks/ScheduledTaskWorker.cs
+@@ -264,30 +264,38 @@ public class ScheduledTaskWorker : IScheduledTaskWorker
+     /// <param name="e">The <see cref="EventArgs" /> instance containing the event data.</param>
+     private async void OnTriggerTriggered(object sender, EventArgs e)
+     {
+-        var trigger = (ITaskTrigger)sender;
+-
+-        if (!ReplicaRole.IsLeader)
++        // async void: an exception escaping here ends the server process, so log it and carry on.
++        try
+         {
+-            // Defense in depth, triggers never arm on a follower so this should not fire.
+-            _logger.LogWarning("{Trigger} fired for task {Task} on a follower replica, ignoring. Triggered work runs on the leader only", trigger.GetType().Name, Name);
+-            trigger.Stop();
+-            return;
+-        }
++            var trigger = (ITaskTrigger)sender;
+ 
+-        if (ScheduledTask is IConfigurableScheduledTask configurableTask && !configurableTask.IsEnabled)
+-        {
+-            return;
+-        }
++            if (!ReplicaRole.IsLeader)
++            {
++                // Defense in depth, triggers never arm on a follower so this should not fire.
++                _logger.LogWarning("{Trigger} fired for task {Task} on a follower replica, ignoring. Triggered work runs on the leader only", trigger.GetType().Name, Name);
++                trigger.Stop();
++                return;
++            }
+ 
+-        _logger.LogDebug("{0} fired for task: {1}", trigger.GetType().Name, Name);
++            if (ScheduledTask is IConfigurableScheduledTask configurableTask && !configurableTask.IsEnabled)
++            {
++                return;
++            }
+ 
+-        trigger.Stop();
++            _logger.LogDebug("{0} fired for task: {1}", trigger.GetType().Name, Name);
++
++            trigger.Stop();
+ 
+-        _taskManager.QueueScheduledTask(ScheduledTask, trigger.TaskOptions);
++            _taskManager.QueueScheduledTask(ScheduledTask, trigger.TaskOptions);
+ 
+-        await Task.Delay(1000).ConfigureAwait(false);
++            await Task.Delay(1000).ConfigureAwait(false);
+ 
+-        trigger.Start(LastExecutionResult, _logger, Name, false);
++            trigger.Start(LastExecutionResult, _logger, Name, false);
++        }
++        catch (Exception ex)
++        {
++            _logger.LogError(ex, "Error handling a trigger for task {Task}", Name);
++        }
+     }
+ 
+     /// <summary>
+diff --git a/Emby.Server.Implementations/ScheduledTasks/Triggers/StartupTrigger.cs b/Emby.Server.Implementations/ScheduledTasks/Triggers/StartupTrigger.cs
+index 86ceff6..2702d96 100644
+--- a/Emby.Server.Implementations/ScheduledTasks/Triggers/StartupTrigger.cs
++++ b/Emby.Server.Implementations/ScheduledTasks/Triggers/StartupTrigger.cs
+@@ -32,9 +32,17 @@ public sealed class StartupTrigger : ITaskTrigger
+     {
+         if (isApplicationStartup)
+         {
+-            await Task.Delay(DelayMs).ConfigureAwait(false);
+-
+-            OnTriggered();
++            // async void: an exception escaping here ends the server process, so log it and carry on.
++            try
++            {
++                await Task.Delay(DelayMs).ConfigureAwait(false);
++
++                OnTriggered();
++            }
++            catch (Exception ex)
++            {
++                logger.LogError(ex, "Error firing the startup trigger for task {Task}", taskName);
++            }
+         }
+     }
+ 
+diff --git a/Emby.Server.Implementations/Session/WebSocketController.cs b/Emby.Server.Implementations/Session/WebSocketController.cs
+index c45a4a6..e51efc6 100644
+--- a/Emby.Server.Implementations/Session/WebSocketController.cs
++++ b/Emby.Server.Implementations/Session/WebSocketController.cs
+@@ -77,21 +77,32 @@ namespace Emby.Server.Implementations.Session
+ 
+         private async void OnConnectionClosed(object? sender, EventArgs e)
+         {
+-            var connection = sender as IWebSocketConnection ?? throw new ArgumentException($"{nameof(sender)} is not of type {nameof(IWebSocketConnection)}", nameof(sender));
+-            _logger.LogDebug("Removing websocket from session {Session}", _session.Id);
+-            ObjectDisposedException.ThrowIf(_disposed, this);
++            // async void: an exception escaping here ends the server process, so log it and carry on.
+             try
+             {
+-                _socketsLock.EnterWriteLock();
+-                _sockets.Remove(connection);
+-                connection.Closed -= OnConnectionClosed;
++                if (sender is not IWebSocketConnection connection || _disposed)
++                {
++                    return;
++                }
++
++                _logger.LogDebug("Removing websocket from session {Session}", _session.Id);
++                try
++                {
++                    _socketsLock.EnterWriteLock();
++                    _sockets.Remove(connection);
++                    connection.Closed -= OnConnectionClosed;
++                }
++                finally
++                {
++                    _socketsLock.ExitWriteLock();
++                }
++
++                await _sessionManager.CloseIfNeededAsync(_session).ConfigureAwait(false);
+             }
+-            finally
++            catch (Exception ex)
+             {
+-                _socketsLock.ExitWriteLock();
++                _logger.LogError(ex, "Error closing websocket for session {Session}", _session.Id);
+             }
+-
+-            await _sessionManager.CloseIfNeededAsync(_session).ConfigureAwait(false);
+         }
+ 
+         /// <inheritdoc />
+diff --git a/src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs b/src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs
+index 8a5aecc..aedc626 100644
+--- a/src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs
++++ b/src/Jellyfin.LiveTv/Recordings/RecordingsManager.cs
+@@ -446,7 +446,15 @@ public sealed class RecordingsManager : IRecordingsManager, IDisposable
+     {
+         if (string.Equals(e.Key, "livetv", StringComparison.OrdinalIgnoreCase))
+         {
+-            await CreateRecordingFolders().ConfigureAwait(false);
++            // async void: an exception escaping here ends the server process, so log it and carry on.
++            try
++            {
++                await CreateRecordingFolders().ConfigureAwait(false);
++            }
++            catch (Exception ex)
++            {
++                _logger.LogError(ex, "Error creating recording folders after a livetv configuration change");
++            }
+         }
+     }
+ 
+-- 
+2.56.0
+
