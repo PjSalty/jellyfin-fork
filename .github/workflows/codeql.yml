@@ -31,4 +31,68 @@ jobs:
           ./build/assemble.sh
           dotnet build upstream/Jellyfin.Server/Jellyfin.Server.csproj -c Release
 
+      # Manual-build analysis ignores the config file's paths and paths-ignore,
+      # so analyze without uploading, filter the SARIF, then upload it.
       - uses: github/codeql-action/analyze@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3
+        with:
+          upload: never
+          output: sarif-results
+
+      - name: Keep results in files our patches change
+        run: |
+          set -euo pipefail
+          # The shallow root of upstream/ is the pristine upstream commit.
+          root="$(git -C upstream rev-list --max-parents=0 HEAD)"
+          git -C upstream diff --name-only "${root}" HEAD | sed 's|^|upstream/|' > "${RUNNER_TEMP}/patched-files.txt"
+          if [ ! -s "${RUNNER_TEMP}/patched-files.txt" ]; then
+            echo "::error::no patched files found; the assembly is broken"
+            exit 1
+          fi
+          echo "patched files: $(wc -l < "${RUNNER_TEMP}/patched-files.txt")"
+          python3 -I - sarif-results "${RUNNER_TEMP}/patched-files.txt" <<'PY'
+          import glob, json, os, sys
+          from urllib.parse import unquote
+
+          sarif_dir, list_file = sys.argv[1], sys.argv[2]
+          keep = set(open(list_file).read().splitlines()) - {""}
+          workspace = os.environ.get("GITHUB_WORKSPACE", "").rstrip("/") + "/"
+
+
+          def rel(uri):
+              uri = unquote(uri)
+              if uri.startswith("file://"):
+                  uri = uri[len("file://"):]
+              if workspace != "/" and uri.startswith(workspace):
+                  uri = uri[len(workspace):]
+              while uri.startswith("./"):
+                  uri = uri[2:]
+              return uri
+
+
+          def primary(result):
+              try:
+                  return rel(result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"])
+              except (KeyError, IndexError, TypeError):
+                  return None
+
+
+          files = sorted(glob.glob(os.path.join(sarif_dir, "*.sarif")))
+          if not files:
+              sys.exit("no SARIF files in " + sarif_dir)
+          for path in files:
+              with open(path) as fh:
+                  log = json.load(fh)
+              kept = dropped = 0
+              for run in log.get("runs", []):
+                  results = run.get("results", [])
+                  run["results"] = [r for r in results if primary(r) in keep]
+                  kept += len(run["results"])
+                  dropped += len(results) - len(run["results"])
+              with open(path, "w") as fh:
+                  json.dump(log, fh)
+              print(f"{path}: kept {kept}, dropped {dropped}")
+          PY
+
+      - uses: github/codeql-action/upload-sarif@4bfa242aa49c5f7c6770b98670d354a7dfac05f8 # v3
+        with:
+          sarif_file: sarif-results
