@@ -1,6 +1,6 @@
 # Divergence from upstream
 
-Everything this repo changes relative to [jellyfin/jellyfin](https://github.com/jellyfin/jellyfin) at the ref pinned in `UPSTREAM_REF` (v12.1). The list is the contract: if it's not here, we didn't change it.
+Everything this repo changes relative to [jellyfin/jellyfin](https://github.com/jellyfin/jellyfin) at the ref pinned in `UPSTREAM_REF` (v12.4). The list is the contract: if it's not here, we didn't change it.
 
 Patch numbers are stable across releases: each patch keeps the number it was first given (its `Patch: 00NN` trailer), so gaps are patches that upstream absorbed. Every patch message carries the full Intent, Ceiling and Drop when; the table is the summary.
 
@@ -25,6 +25,8 @@ Patch numbers are stable across releases: each patch keeps the number it was fir
 | `0025-playstate-keep-Transcode-across-a-job-gap-of-the-sam.patch` | new at 12.1. `ValidatePlayMethod` keeps a reported `Transcode` that no job matches when the reporting user's session on that device is already playing the same item as `Transcode`. A web stream change (burned-in subtitle, quality, audio track) or a seek restart kills the job before the next one registers, and the web client's progress report in that gap carries the killed job's PlaySessionId, so the session read `DirectPlay` next to a live NVENC transcode. A new item gets upstream's check unchanged; `PlaystateControllerTests` covers both | upstream tolerates the gap between a killed and a restarted transcode |
 | `0026-views-probe-one-item-before-listing-every-playlist-.patch` | new at 12.2. `UserViewManager.HasVisibleItem` (12.2) loads every playlist or collection with its linked children on each views resolution, so on every browse request, to ask whether any is visible: about 730 rows and 15 ms per request on 60 playlists. One item is probed first and the full list is only loaded when that item is not visible; the answer is unchanged | upstream answers the question with a bounded query |
 | `0027-migrations-restore-inherited-rating-scores-in-Migrat.patch` | new after 12.2. `MigrateRatingLevels` leaves every item without a rating of its own with no stored score, and list queries filter on the stored score, so until each item is next saved a profile with a rating limit is listed the seasons and episodes of shows above it (detail and playback still refuse them). The routine now gives those items the stored score of their display parent, level by level, in the same transaction. Builds on the test file 0020 adds | upstream scores inherited ratings in the routine, or stops filtering lists on the stored column |
+
+At 12.4 every patch carries over unchanged: upstream `v12.2...v12.4` is 17 commits (TMDb year ties, probing and subtitle fixes, non-finite ratings, .NET 10.0.14 and the matching Microsoft package pins) and none of them touches a patched file, so all 19 apply to v12.4 as they applied to v12.2.
 
 Dropped at 12.1, because upstream absorbed the change or removed the code it targeted:
 
