@@ -2,7 +2,7 @@
 # official image, keeping its jellyfin-web and jellyfin-ffmpeg untouched.
 # Build context is the repo root with the assembled tree at upstream/
 # (see build/assemble.sh).
-ARG BASE_IMAGE=jellyfin/jellyfin:12.2
+ARG BASE_IMAGE=jellyfin/jellyfin:12.4
 ARG SDK_IMAGE=mcr.microsoft.com/dotnet/sdk:10.0
 
 FROM ${SDK_IMAGE} AS build
