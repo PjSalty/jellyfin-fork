@@ -1,0 +1,110 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 14:40:21 -0600
+Subject: [PATCH 22/22] tests: cover the websocket close and startup trigger guards
+
+Intent: patch 0029 shipped its guards without tests of their own. Two
+regression tests drive the exceptions the guards exist for: the session
+manager throwing from CloseIfNeededAsync when a websocket closes, and a
+startup trigger handler throwing after the trigger's delay. Without
+0029 both end the test host with an unhandled exception from the async
+void method (xUnit catastrophic failure); with it both pass.
+Ceiling: covers two of the five 0029 call sites. ScheduledTaskWorker,
+RecordingsManager and the LibraryChangedNotifier skip need heavier
+fixtures and rely on the existing suites.
+Drop when: patch 0029 is dropped.
+Patch: 0030
+---
+ .../ScheduledTasks/StartupTriggerTests.cs     | 33 ++++++++++++++++
+ .../WebSocketControllerTests.cs               | 39 +++++++++++++++++++
+ 2 files changed, 72 insertions(+)
+ create mode 100644 tests/Jellyfin.Server.Implementations.Tests/ScheduledTasks/StartupTriggerTests.cs
+ create mode 100644 tests/Jellyfin.Server.Implementations.Tests/SessionManager/WebSocketControllerTests.cs
+
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/ScheduledTasks/StartupTriggerTests.cs b/tests/Jellyfin.Server.Implementations.Tests/ScheduledTasks/StartupTriggerTests.cs
+new file mode 100644
+index 0000000..3027c3e
+--- /dev/null
++++ b/tests/Jellyfin.Server.Implementations.Tests/ScheduledTasks/StartupTriggerTests.cs
+@@ -0,0 +1,33 @@
++using System;
++using System.Threading.Tasks;
++using Emby.Server.Implementations.ScheduledTasks.Triggers;
++using MediaBrowser.Model.Tasks;
++using Microsoft.Extensions.Logging.Abstractions;
++using Xunit;
++
++namespace Jellyfin.Server.Implementations.Tests.ScheduledTasks;
++
++public class StartupTriggerTests
++{
++    [Fact]
++    public async Task Start_TriggeredHandlerThrows_ProcessSurvives()
++    {
++        // Start is async void and fires its handlers after a delay: a handler that throws must be
++        // logged, not end the process.
++        var fired = new TaskCompletionSource();
++        var trigger = new StartupTrigger(new TaskOptions());
++        trigger.Triggered += (_, _) =>
++        {
++            fired.TrySetResult();
++            throw new InvalidOperationException("handler failed");
++        };
++
++        trigger.Start(null, NullLogger.Instance, "test", isApplicationStartup: true);
++
++        await fired.Task.WaitAsync(TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
++
++        // Give an escaping exception time to reach the thread pool; on the old code the run fails here.
++        await Task.Delay(500, TestContext.Current.CancellationToken);
++        Assert.True(fired.Task.IsCompleted);
++    }
++}
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/SessionManager/WebSocketControllerTests.cs b/tests/Jellyfin.Server.Implementations.Tests/SessionManager/WebSocketControllerTests.cs
+new file mode 100644
+index 0000000..6dafec7
+--- /dev/null
++++ b/tests/Jellyfin.Server.Implementations.Tests/SessionManager/WebSocketControllerTests.cs
+@@ -0,0 +1,39 @@
++using System;
++using System.Threading.Tasks;
++using Emby.Server.Implementations.Session;
++using MediaBrowser.Controller.Net;
++using MediaBrowser.Controller.Session;
++using Microsoft.Extensions.Logging.Abstractions;
++using Moq;
++using Xunit;
++
++namespace Jellyfin.Server.Implementations.Tests.SessionManager;
++
++public class WebSocketControllerTests
++{
++    [Fact]
++    public async Task ConnectionClosed_CloseIfNeededThrows_ProcessSurvives()
++    {
++        // OnConnectionClosed is async void: an exception escaping it ends the process. A busy
++        // database inside CloseIfNeededAsync must cost this cleanup, not the server.
++        var called = new TaskCompletionSource();
++        var sessionManager = new Mock<ISessionManager>();
++        sessionManager
++            .Setup(s => s.CloseIfNeededAsync(It.IsAny<SessionInfo>()))
++            .Callback(() => called.TrySetResult())
++            .Throws(new InvalidOperationException("The connection pool has been exhausted"));
++
++        var session = new SessionInfo(sessionManager.Object, NullLogger.Instance);
++        using var controller = new WebSocketController(NullLogger<WebSocketController>.Instance, session, sessionManager.Object);
++        var connection = new Mock<IWebSocketConnection>();
++        controller.AddWebSocket(connection.Object);
++
++        connection.Raise(c => c.Closed += null, connection.Object, EventArgs.Empty);
++
++        await called.Task.WaitAsync(TimeSpan.FromSeconds(15), TestContext.Current.CancellationToken);
++
++        // Give an escaping exception time to reach the thread pool; on the old code the run fails here.
++        await Task.Delay(500, TestContext.Current.CancellationToken);
++        Assert.True(called.Task.IsCompleted);
++    }
++}
+-- 
+2.56.0
+
