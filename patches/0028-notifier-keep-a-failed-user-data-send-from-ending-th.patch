@@ -1,0 +1,166 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Salty <99386653+PjSalty@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 09:25:10 -0600
+Subject: [PATCH 20/20] notifier: keep a failed user data send from ending the
+ process
+
+Intent: UserDataChangeNotifier.UpdateTimerCallback is async void on a
+timer thread and sends each user's batch with no exception handling.
+The change info is built from the database inside the send, so when the
+database is busy (Npgsql connection pool exhausted after its 15 s wait,
+or a command timeout) the exception escapes the callback and the runtime
+terminates the server. Measured on a copy of a production library: the
+leader crashed (exit 139) in 2 of 6 one-minute runs of 64 clients with
+30% watched/favorite writes at the default pool of 15. Each user's send
+now runs in its own try/catch that logs a warning and drops that batch,
+the way LibraryChangedNotifier already guards its sends. The notifier
+gets an ILogger; dependency injection supplies it. Includes a test that
+fails with an unhandled-exception crash on the old code.
+Ceiling: a dropped batch means those clients miss one live played/
+favorite refresh until their next poll or page load; nothing is retried.
+Drop when: upstream guards UpdateTimerCallback (or stops building the
+change info from the database on the timer thread).
+Patch: 0028
+---
+ .../EntryPoints/UserDataChangeNotifier.cs     | 28 ++++++++---
+ .../UserDataChangeNotifierTests.cs            | 49 ++++++++++++++++++-
+ 2 files changed, 70 insertions(+), 7 deletions(-)
+
+diff --git a/Emby.Server.Implementations/EntryPoints/UserDataChangeNotifier.cs b/Emby.Server.Implementations/EntryPoints/UserDataChangeNotifier.cs
+index b182e58..8e37b45 100644
+--- a/Emby.Server.Implementations/EntryPoints/UserDataChangeNotifier.cs
++++ b/Emby.Server.Implementations/EntryPoints/UserDataChangeNotifier.cs
+@@ -9,6 +9,7 @@ using MediaBrowser.Controller.Session;
+ using MediaBrowser.Model.Entities;
+ using MediaBrowser.Model.Session;
+ using Microsoft.Extensions.Hosting;
++using Microsoft.Extensions.Logging;
+ 
+ namespace Emby.Server.Implementations.EntryPoints
+ {
+@@ -23,6 +24,7 @@ namespace Emby.Server.Implementations.EntryPoints
+         private readonly ISessionManager _sessionManager;
+         private readonly IUserDataManager _userDataManager;
+         private readonly IUserManager _userManager;
++        private readonly ILogger<UserDataChangeNotifier> _logger;
+ 
+         private readonly Dictionary<Guid, Dictionary<Guid, BaseItem>> _changedItems = [];
+         private readonly Lock _syncLock = new();
+@@ -36,14 +38,17 @@ namespace Emby.Server.Implementations.EntryPoints
+         /// <param name="userDataManager">The <see cref="IUserDataManager"/>.</param>
+         /// <param name="sessionManager">The <see cref="ISessionManager"/>.</param>
+         /// <param name="userManager">The <see cref="IUserManager"/>.</param>
++        /// <param name="logger">The <see cref="ILogger{UserDataChangeNotifier}"/>.</param>
+         public UserDataChangeNotifier(
+             IUserDataManager userDataManager,
+             ISessionManager sessionManager,
+-            IUserManager userManager)
++            IUserManager userManager,
++            ILogger<UserDataChangeNotifier> logger)
+         {
+             _userDataManager = userDataManager;
+             _sessionManager = sessionManager;
+             _userManager = userManager;
++            _logger = logger;
+         }
+ 
+         /// <inheritdoc />
+@@ -144,11 +149,22 @@ namespace Emby.Server.Implementations.EntryPoints
+ 
+             foreach (var (userId, changedItems) in changes)
+             {
+-                await _sessionManager.SendMessageToUserSessions(
+-                    [userId],
+-                    SessionMessageType.UserDataChanged,
+-                    () => GetUserDataChangeInfo(userId, changedItems.Values),
+-                    default).ConfigureAwait(false);
++                // This callback is async void on a timer thread, so an exception escaping it ends the
++                // process. The change info is built from the database inside the send; a busy database
++                // (connection pool exhausted, command timeout) must cost this user's batch, not the server
++                // and not the other users' batches in the same window.
++                try
++                {
++                    await _sessionManager.SendMessageToUserSessions(
++                        [userId],
++                        SessionMessageType.UserDataChanged,
++                        () => GetUserDataChangeInfo(userId, changedItems.Values),
++                        default).ConfigureAwait(false);
++                }
++                catch (Exception ex)
++                {
++                    _logger.LogWarning(ex, "Failed to send user data changes for user {UserId}; the batch is dropped", userId);
++                }
+             }
+         }
+ 
+diff --git a/tests/Jellyfin.Server.Implementations.Tests/EntryPoints/UserDataChangeNotifierTests.cs b/tests/Jellyfin.Server.Implementations.Tests/EntryPoints/UserDataChangeNotifierTests.cs
+index 0274398..66bc15a 100644
+--- a/tests/Jellyfin.Server.Implementations.Tests/EntryPoints/UserDataChangeNotifierTests.cs
++++ b/tests/Jellyfin.Server.Implementations.Tests/EntryPoints/UserDataChangeNotifierTests.cs
+@@ -8,6 +8,7 @@ using MediaBrowser.Controller.Library;
+ using MediaBrowser.Controller.Session;
+ using MediaBrowser.Model.Entities;
+ using MediaBrowser.Model.Session;
++using Microsoft.Extensions.Logging.Abstractions;
+ using Moq;
+ using Xunit;
+ 
+@@ -60,8 +61,54 @@ public class UserDataChangeNotifierTests
+         notifier.Dispose();
+     }
+ 
++    [Fact]
++    public async Task UpdateTimerCallback_SendThrows_OtherUsersStillNotifiedAndProcessSurvives()
++    {
++        // The callback is async void on a timer thread: an exception escaping it ends the process.
++        // A database that is busy (pool exhausted, command timeout) for one user's batch must cost
++        // that batch only, and the users after it in the same window must still get theirs.
++        var failingUser = Guid.NewGuid();
++        var healthyUser = Guid.NewGuid();
++        _sessionManager
++            .Setup(e => e.SendMessageToUserSessions(
++                It.Is<System.Collections.Generic.List<Guid>>(ids => ids.Contains(failingUser)),
++                SessionMessageType.UserDataChanged,
++                It.IsAny<Func<UserDataChangeInfo>>(),
++                It.IsAny<CancellationToken>()))
++            .ThrowsAsync(new InvalidOperationException("The connection pool has been exhausted"));
++
++        var notifier = CreateNotifier();
++        await notifier.StartAsync(TestContext.Current.CancellationToken);
++
++        // Insertion order puts the failing user first in the batch.
++        RaiseUserDataSaved(failingUser);
++        RaiseUserDataSaved(healthyUser);
++
++        var stopwatch = Stopwatch.StartNew();
++        while (stopwatch.Elapsed < _flushTimeout && Volatile.Read(ref _flushCount) == 0)
++        {
++            await Task.Delay(25, TestContext.Current.CancellationToken);
++        }
++
++        Assert.True(Volatile.Read(ref _flushCount) > 0, "The user after the failing one was never notified.");
++
++        // A later batch still goes out: the notifier survived the failure.
++        Interlocked.Exchange(ref _flushCount, 0);
++        RaiseUserDataSaved(healthyUser);
++        stopwatch.Restart();
++        while (stopwatch.Elapsed < _flushTimeout && Volatile.Read(ref _flushCount) == 0)
++        {
++            await Task.Delay(25, TestContext.Current.CancellationToken);
++        }
++
++        Assert.True(Volatile.Read(ref _flushCount) > 0, "No batch was sent after a failed one.");
++
++        await notifier.StopAsync(TestContext.Current.CancellationToken);
++        notifier.Dispose();
++    }
++
+     private UserDataChangeNotifier CreateNotifier()
+-        => new(_userDataManager.Object, _sessionManager.Object, _userManager.Object);
++        => new(_userDataManager.Object, _sessionManager.Object, _userManager.Object, NullLogger<UserDataChangeNotifier>.Instance);
+ 
+     // A folder needs none of BaseItem's static services, and PlaybackProgress is the one reason the
+     // notifier ignores outright.
+-- 
+2.56.0
+
